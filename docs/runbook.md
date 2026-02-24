@@ -47,6 +47,25 @@ Complete these checks before deploying to production.
       Multiple instances managing the same zone **must** have different owner IDs
       to avoid ownership conflicts.
 
+### Multi-Zone Deployments
+
+When using `--rfc2136-config-file` or `EXTERNAL_DNS_RFC2136_ZONE_*` env vars:
+
+- [ ] Every zone listed in the config is reachable from the host
+      (`dig SOA zone. @nshost` for each zone).
+- [ ] Each zone has its own TSIG key with `allow-update` permission configured
+      on its DNS server.
+- [ ] Preflight passes for all zones: run with `--skip-preflight=false` (default)
+      and confirm `"DNS preflight check passed"` appears in the logs.
+- [ ] Zone names do not overlap in ways that cause unexpected routing. Endpoints
+      are routed by longest-suffix match; a subdomain zone (e.g. `sub.example.com.`)
+      takes priority over the parent zone (`example.com.`) for matching endpoints.
+- [ ] Unmanaged zones: endpoints whose DNS name does not match any configured zone
+      are skipped with a WARN log. Review logs for unexpected skip messages.
+- [ ] Only one configuration mode is active. Mixing `--rfc2136-config-file` with
+      single-zone flags, or env-prefix vars with single-zone flags, causes an
+      immediate exit with an error.
+
 ---
 
 ## Common Failure Modes

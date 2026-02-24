@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,23 +20,30 @@ import (
 
 	dockerclient "github.com/docker/docker/client"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.yaml.in/yaml/v2"
 
 	"github.com/bkero/external-dns-docker/pkg/controller"
+	"github.com/bkero/external-dns-docker/pkg/provider"
 	"github.com/bkero/external-dns-docker/pkg/provider/rfc2136"
 	"github.com/bkero/external-dns-docker/pkg/source"
 )
 
+// preflightProvider is satisfied by both *rfc2136.Provider and *rfc2136.MultiProvider.
+type preflightProvider interface {
+	Preflight(ctx context.Context) error
+}
+
 func main() {
-	// ---- RFC2136 provider flags ----
+	// ---- RFC2136 provider flags (Mode 1: single-zone) ----
 	rfc2136Host := flag.String("rfc2136-host",
 		envOr("EXTERNAL_DNS_RFC2136_HOST", ""),
-		"RFC2136 DNS server host (required)")
+		"RFC2136 DNS server host (single-zone mode)")
 	rfc2136Port := flag.Int("rfc2136-port",
 		envOrInt("EXTERNAL_DNS_RFC2136_PORT", 53),
 		"RFC2136 DNS server port")
 	rfc2136Zone := flag.String("rfc2136-zone",
 		envOr("EXTERNAL_DNS_RFC2136_ZONE", ""),
-		"DNS zone to manage (required)")
+		"DNS zone to manage (single-zone mode)")
 	rfc2136TSIGKey := flag.String("rfc2136-tsig-key",
 		envOr("EXTERNAL_DNS_RFC2136_TSIG_KEY", ""),
 		"TSIG key name")
@@ -54,6 +62,11 @@ func main() {
 	rfc2136Timeout := flag.Duration("rfc2136-timeout",
 		envOrDuration("EXTERNAL_DNS_RFC2136_TIMEOUT", 10*time.Second),
 		"Timeout for RFC2136 DNS operations (AXFR and UPDATE)")
+
+	// ---- RFC2136 provider flags (Mode 3: YAML config file) ----
+	rfc2136ConfigFile := flag.String("rfc2136-config-file",
+		envOr("EXTERNAL_DNS_RFC2136_CONFIG_FILE", ""),
+		"Path to YAML file defining multiple RFC2136 zones (mutually exclusive with single-zone flags)")
 
 	// ---- Docker source flags ----
 	dockerHost := flag.String("docker-host",
@@ -119,29 +132,93 @@ func main() {
 
 	log := newLogger(*logLevel)
 
-	// ---- Validate required configuration ----
-	if *rfc2136Host == "" {
-		log.Error("--rfc2136-host is required (or set EXTERNAL_DNS_RFC2136_HOST)")
-		os.Exit(1)
-	}
-	if *rfc2136Zone == "" {
-		log.Error("--rfc2136-zone is required (or set EXTERNAL_DNS_RFC2136_ZONE)")
+	// ---- Mode detection and mutual-exclusivity ----
+	//
+	// Priority: Mode 3 (YAML file) > Mode 2 (env prefix) > Mode 1 (single-zone flags)
+	// Mixing any two modes is an error.
+
+	singleZoneFlagsSet := *rfc2136Host != "" || *rfc2136Zone != ""
+
+	envConfigs, envModeActive, err := loadZoneConfigsFromEnv()
+	if err != nil {
+		log.Error("invalid multi-zone env var configuration", "err", err)
 		os.Exit(1)
 	}
 
-	// ---- Resolve TSIG secret (flag vs. file) ----
-	if *rfc2136TSIGSecret != "" && *rfc2136TSIGSecretFile != "" {
-		log.Error("--rfc2136-tsig-secret and --rfc2136-tsig-secret-file are mutually exclusive")
-		os.Exit(1)
-	}
-	tsigSecret := *rfc2136TSIGSecret
-	if *rfc2136TSIGSecretFile != "" {
-		data, err := os.ReadFile(*rfc2136TSIGSecretFile)
-		if err != nil {
-			log.Error("failed to read TSIG secret file", "path", *rfc2136TSIGSecretFile, "err", err)
+	var (
+		prov   provider.Provider
+		pfProv preflightProvider
+		mode   string // for startup log
+		zones  int    // for startup log (multi-zone only)
+	)
+
+	switch {
+	case *rfc2136ConfigFile != "":
+		// Mode 3: YAML config file
+		if singleZoneFlagsSet {
+			log.Error("--rfc2136-config-file is mutually exclusive with --rfc2136-host / --rfc2136-zone")
 			os.Exit(1)
 		}
-		tsigSecret = strings.TrimSpace(string(data))
+		if envModeActive {
+			log.Error("--rfc2136-config-file is mutually exclusive with EXTERNAL_DNS_RFC2136_ZONE_* env vars")
+			os.Exit(1)
+		}
+		configs, ferr := loadZoneConfigsFromFile(*rfc2136ConfigFile)
+		if ferr != nil {
+			log.Error("failed to load zone config file", "path", *rfc2136ConfigFile, "err", ferr)
+			os.Exit(1)
+		}
+		mp := rfc2136.NewMulti(configs, log)
+		prov = mp
+		pfProv = mp
+		mode = "multi-zone (yaml-file)"
+		zones = len(configs)
+
+	case envModeActive:
+		// Mode 2: environment variable prefixes
+		if singleZoneFlagsSet {
+			log.Error("EXTERNAL_DNS_RFC2136_ZONE_* env vars are mutually exclusive with --rfc2136-host / --rfc2136-zone")
+			os.Exit(1)
+		}
+		mp := rfc2136.NewMulti(envConfigs, log)
+		prov = mp
+		pfProv = mp
+		mode = "multi-zone (env-prefix)"
+		zones = len(envConfigs)
+
+	case *rfc2136Host != "" && *rfc2136Zone != "":
+		// Mode 1: single-zone flags (original behaviour — fully backward compatible)
+		if *rfc2136TSIGSecret != "" && *rfc2136TSIGSecretFile != "" {
+			log.Error("--rfc2136-tsig-secret and --rfc2136-tsig-secret-file are mutually exclusive")
+			os.Exit(1)
+		}
+		tsigSecret := *rfc2136TSIGSecret
+		if *rfc2136TSIGSecretFile != "" {
+			data, rerr := os.ReadFile(*rfc2136TSIGSecretFile)
+			if rerr != nil {
+				log.Error("failed to read TSIG secret file", "path", *rfc2136TSIGSecretFile, "err", rerr)
+				os.Exit(1)
+			}
+			tsigSecret = strings.TrimSpace(string(data))
+		}
+		sp := rfc2136.New(rfc2136.Config{
+			Host:          *rfc2136Host,
+			Port:          *rfc2136Port,
+			Zone:          *rfc2136Zone,
+			TSIGKeyName:   *rfc2136TSIGKey,
+			TSIGSecret:    tsigSecret,
+			TSIGSecretAlg: *rfc2136TSIGAlg,
+			MinTTL:        *rfc2136MinTTL,
+			Timeout:       *rfc2136Timeout,
+		}, log)
+		prov = sp
+		pfProv = sp
+		mode = "single-zone"
+
+	default:
+		log.Error("no RFC2136 configuration provided; use --rfc2136-host/--rfc2136-zone, " +
+			"EXTERNAL_DNS_RFC2136_ZONE_* env vars, or --rfc2136-config-file")
+		os.Exit(1)
 	}
 
 	// ---- Build Docker source ----
@@ -165,23 +242,11 @@ func main() {
 		}
 	}()
 
-	// ---- Build RFC2136 provider ----
-	prov := rfc2136.New(rfc2136.Config{
-		Host:          *rfc2136Host,
-		Port:          *rfc2136Port,
-		Zone:          *rfc2136Zone,
-		TSIGKeyName:   *rfc2136TSIGKey,
-		TSIGSecret:    tsigSecret,
-		TSIGSecretAlg: *rfc2136TSIGAlg,
-		MinTTL:        *rfc2136MinTTL,
-		Timeout:       *rfc2136Timeout,
-	}, log)
-
 	// ---- Preflight DNS connectivity check ----
 	if !*skipPreflight {
 		preflightCtx, preflightCancel := context.WithTimeout(context.Background(), *rfc2136Timeout)
 		defer preflightCancel()
-		if err := prov.Preflight(preflightCtx); err != nil {
+		if err := pfProv.Preflight(preflightCtx); err != nil {
 			log.Error("DNS preflight check failed — use --skip-preflight to bypass", "err", err)
 			os.Exit(1)
 		}
@@ -217,13 +282,24 @@ func main() {
 	}
 
 	// ---- Run ----
-	log.Info("starting external-dns-docker",
-		"rfc2136-host", *rfc2136Host,
-		"rfc2136-zone", *rfc2136Zone,
-		"interval", interval.String(),
-		"dry-run", *dryRun,
-		"once", *once,
-	)
+	if zones > 0 {
+		log.Info("starting external-dns-docker",
+			"mode", mode,
+			"zones", zones,
+			"interval", interval.String(),
+			"dry-run", *dryRun,
+			"once", *once,
+		)
+	} else {
+		log.Info("starting external-dns-docker",
+			"mode", mode,
+			"rfc2136-host", *rfc2136Host,
+			"rfc2136-zone", *rfc2136Zone,
+			"interval", interval.String(),
+			"dry-run", *dryRun,
+			"once", *once,
+		)
+	}
 
 	if err := ctrl.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		log.Error("controller exited with error", "err", err)
@@ -362,4 +438,186 @@ func envOrDuration(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return d
+}
+
+// zoneFieldSetter maps an env var suffix to a setter function for ZoneConfig.
+// Longer suffixes must appear before shorter ones that are prefixes of them
+// (e.g. TSIG_SECRET_FILE before TSIG_SECRET).
+type zoneFieldSetter struct {
+	suffix string
+	set    func(zc *rfc2136.ZoneConfig, val string) error
+}
+
+var zoneFieldSetters = []zoneFieldSetter{
+	{"TSIG_SECRET_FILE", func(zc *rfc2136.ZoneConfig, val string) error { zc.TSIGSecretFile = val; return nil }},
+	{"TSIG_SECRET", func(zc *rfc2136.ZoneConfig, val string) error { zc.TSIGSecret = val; return nil }},
+	{"TSIG_KEY", func(zc *rfc2136.ZoneConfig, val string) error { zc.TSIGKey = val; return nil }},
+	{"TSIG_ALG", func(zc *rfc2136.ZoneConfig, val string) error { zc.TSIGAlg = val; return nil }},
+	{"MIN_TTL", func(zc *rfc2136.ZoneConfig, val string) error {
+		n, err := strconv.ParseInt(val, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid MIN_TTL %q: %w", val, err)
+		}
+		zc.MinTTL = n
+		return nil
+	}},
+	{"TIMEOUT", func(zc *rfc2136.ZoneConfig, val string) error {
+		d, err := time.ParseDuration(val)
+		if err != nil {
+			return fmt.Errorf("invalid TIMEOUT %q: %w", val, err)
+		}
+		zc.Timeout = d
+		return nil
+	}},
+	{"HOST", func(zc *rfc2136.ZoneConfig, val string) error { zc.Host = val; return nil }},
+	{"PORT", func(zc *rfc2136.ZoneConfig, val string) error {
+		n, err := strconv.Atoi(val)
+		if err != nil {
+			return fmt.Errorf("invalid PORT %q: %w", val, err)
+		}
+		zc.Port = n
+		return nil
+	}},
+	{"ZONE", func(zc *rfc2136.ZoneConfig, val string) error { zc.Zone = val; return nil }},
+}
+
+// loadZoneConfigsFromEnv scans os.Environ() for EXTERNAL_DNS_RFC2136_ZONE_<NAME>_<FIELD>
+// variables, groups them by NAME (sorted alphabetically), resolves TSIGSecretFile,
+// and validates required fields. The bool return is true when matching vars were found.
+func loadZoneConfigsFromEnv() ([]rfc2136.ZoneConfig, bool, error) {
+	const prefix = "EXTERNAL_DNS_RFC2136_ZONE_"
+	configs := make(map[string]*rfc2136.ZoneConfig)
+
+	for _, env := range os.Environ() {
+		k, v, ok := strings.Cut(env, "=")
+		if !ok || !strings.HasPrefix(k, prefix) {
+			continue
+		}
+		rest := k[len(prefix):]
+
+		for _, f := range zoneFieldSetters {
+			sfx := "_" + f.suffix
+			if !strings.HasSuffix(rest, sfx) {
+				continue
+			}
+			name := rest[:len(rest)-len(sfx)]
+			if name == "" {
+				break
+			}
+			if configs[name] == nil {
+				configs[name] = &rfc2136.ZoneConfig{}
+			}
+			if serr := f.set(configs[name], v); serr != nil {
+				return nil, true, fmt.Errorf("env %s: %w", k, serr)
+			}
+			break
+		}
+	}
+
+	if len(configs) == 0 {
+		return nil, false, nil
+	}
+
+	names := make([]string, 0, len(configs))
+	for name := range configs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	result := make([]rfc2136.ZoneConfig, 0, len(names))
+	for _, name := range names {
+		zc := configs[name]
+		if zc.Host == "" {
+			return nil, true, fmt.Errorf("zone %s: HOST is required", name)
+		}
+		if zc.Zone == "" {
+			return nil, true, fmt.Errorf("zone %s: ZONE is required", name)
+		}
+		if zc.TSIGSecretFile != "" {
+			data, rerr := os.ReadFile(zc.TSIGSecretFile)
+			if rerr != nil {
+				return nil, true, fmt.Errorf("zone %s: reading TSIG_SECRET_FILE: %w", name, rerr)
+			}
+			zc.TSIGSecret = strings.TrimSpace(string(data))
+			zc.TSIGSecretFile = ""
+		}
+		result = append(result, *zc)
+	}
+
+	return result, true, nil
+}
+
+// yamlZonesFile is the top-level structure of the YAML zone config file.
+type yamlZonesFile struct {
+	Zones []yamlZoneEntry `yaml:"zones"`
+}
+
+type yamlZoneEntry struct {
+	Host           string `yaml:"host"`
+	Port           int    `yaml:"port"`
+	Zone           string `yaml:"zone"`
+	TSIGKey        string `yaml:"tsig-key"`
+	TSIGSecret     string `yaml:"tsig-secret"`
+	TSIGSecretFile string `yaml:"tsig-secret-file"`
+	TSIGAlg        string `yaml:"tsig-alg"`
+	MinTTL         int64  `yaml:"min-ttl"`
+	Timeout        string `yaml:"timeout"` // e.g. "10s"; empty = use provider default
+}
+
+// loadZoneConfigsFromFile reads a YAML zone config file, resolves secret files,
+// validates required fields, and returns a slice of ZoneConfig.
+func loadZoneConfigsFromFile(path string) ([]rfc2136.ZoneConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading config file: %w", err)
+	}
+
+	var raw yamlZonesFile
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("parsing config file: %w", err)
+	}
+
+	configs := make([]rfc2136.ZoneConfig, 0, len(raw.Zones))
+	for i, z := range raw.Zones {
+		if z.Host == "" {
+			return nil, fmt.Errorf("zone[%d]: host is required", i)
+		}
+		if z.Zone == "" {
+			return nil, fmt.Errorf("zone[%d]: zone is required", i)
+		}
+		if z.TSIGSecret != "" && z.TSIGSecretFile != "" {
+			return nil, fmt.Errorf("zone[%d]: tsig-secret and tsig-secret-file are mutually exclusive", i)
+		}
+
+		secret := z.TSIGSecret
+		if z.TSIGSecretFile != "" {
+			fileData, ferr := os.ReadFile(z.TSIGSecretFile)
+			if ferr != nil {
+				return nil, fmt.Errorf("zone[%d]: reading tsig-secret-file: %w", i, ferr)
+			}
+			secret = strings.TrimSpace(string(fileData))
+		}
+
+		var timeout time.Duration
+		if z.Timeout != "" {
+			var terr error
+			timeout, terr = time.ParseDuration(z.Timeout)
+			if terr != nil {
+				return nil, fmt.Errorf("zone[%d]: invalid timeout %q: %w", i, z.Timeout, terr)
+			}
+		}
+
+		configs = append(configs, rfc2136.ZoneConfig{
+			Host:       z.Host,
+			Port:       z.Port,
+			Zone:       z.Zone,
+			TSIGKey:    z.TSIGKey,
+			TSIGSecret: secret,
+			TSIGAlg:    z.TSIGAlg,
+			MinTTL:     z.MinTTL,
+			Timeout:    timeout,
+		})
+	}
+
+	return configs, nil
 }

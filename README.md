@@ -124,6 +124,96 @@ All flags can also be set via environment variables using the `EXTERNAL_DNS_` pr
 | `--shutdown-timeout` | `EXTERNAL_DNS_SHUTDOWN_TIMEOUT` | `30s` | Maximum time to wait for graceful shutdown |
 | `--log-level` | `EXTERNAL_DNS_LOG_LEVEL` | `info` | Log level: debug, info, warn, error |
 
+| `--rfc2136-config-file` | `EXTERNAL_DNS_RFC2136_CONFIG_FILE` | — | Path to YAML file defining multiple RFC2136 zones |
+
+---
+
+## Multi-Zone Configuration
+
+By default the daemon manages a single zone via `--rfc2136-host` and
+`--rfc2136-zone`. To manage multiple zones with one daemon you have two options:
+
+### Option A: YAML config file
+
+Create a YAML file listing all zones and pass it via `--rfc2136-config-file`:
+
+```yaml
+# deploy/zones.example.yaml
+zones:
+  - host: ns1.example.com
+    zone: example.com.
+    tsig-key: example-key
+    tsig-secret: "BASE64_SECRET"
+    tsig-alg: hmac-sha256
+
+  - host: ns2.bke.ro
+    zone: bke.ro.
+    tsig-key: bke-ro-key
+    tsig-secret-file: /run/secrets/bke_ro_tsig
+```
+
+```bash
+docker run --rm \
+  -v /var/run/docker.sock:/var/run/docker.sock:ro \
+  -v /etc/dns/zones.yaml:/etc/dns/zones.yaml:ro \
+  external-dns-docker \
+    --rfc2136-config-file=/etc/dns/zones.yaml
+```
+
+An annotated two-zone template is available at [`deploy/zones.example.yaml`](deploy/zones.example.yaml).
+
+**YAML zone fields:**
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `host` | Yes | — | RFC2136 server hostname or IP |
+| `port` | No | `53` | RFC2136 server port |
+| `zone` | Yes | — | DNS zone to manage |
+| `tsig-key` | No | — | TSIG key name |
+| `tsig-secret` | No | — | Base64-encoded TSIG secret (mutually exclusive with `tsig-secret-file`) |
+| `tsig-secret-file` | No | — | Path to file containing base64 TSIG secret |
+| `tsig-alg` | No | `hmac-sha256` | TSIG algorithm |
+| `min-ttl` | No | `0` | Minimum TTL in seconds (0 = disabled) |
+| `timeout` | No | `10s` | DNS operation timeout |
+
+### Option B: Environment variable prefixes
+
+Set `EXTERNAL_DNS_RFC2136_ZONE_<NAME>_<FIELD>` variables, where `<NAME>` is an
+arbitrary identifier you choose per zone:
+
+```bash
+# Zone 1
+EXTERNAL_DNS_RFC2136_ZONE_PROD_HOST=ns1.example.com
+EXTERNAL_DNS_RFC2136_ZONE_PROD_ZONE=example.com.
+EXTERNAL_DNS_RFC2136_ZONE_PROD_TSIG_KEY=prod-key
+EXTERNAL_DNS_RFC2136_ZONE_PROD_TSIG_SECRET=BASE64_SECRET
+
+# Zone 2
+EXTERNAL_DNS_RFC2136_ZONE_BKERO_HOST=ns2.bke.ro
+EXTERNAL_DNS_RFC2136_ZONE_BKERO_ZONE=bke.ro.
+EXTERNAL_DNS_RFC2136_ZONE_BKERO_TSIG_KEY=bke-key
+EXTERNAL_DNS_RFC2136_ZONE_BKERO_TSIG_SECRET_FILE=/run/secrets/bke_ro_tsig
+```
+
+Supported `<FIELD>` suffixes: `HOST`, `PORT`, `ZONE`, `TSIG_KEY`, `TSIG_SECRET`,
+`TSIG_SECRET_FILE`, `TSIG_ALG`, `MIN_TTL`, `TIMEOUT`.
+
+### Mode exclusivity
+
+The three modes are mutually exclusive. Mixing them (e.g. setting
+`--rfc2136-config-file` alongside `--rfc2136-host`) causes the daemon to exit
+with an error. The priority order is:
+YAML file > env-prefix vars > single-zone flags.
+
+### Zone routing
+
+Endpoints are routed to the zone whose name is the **longest suffix match** of
+the endpoint's DNS name. For example, with zones `[example.com., bke.ro.]`:
+
+- `app.example.com` → `example.com.`
+- `api.bke.ro` → `bke.ro.`
+- `app.unknown.tld` → no match → WARN logged, endpoint skipped
+
 ---
 
 ## Ownership and Safety

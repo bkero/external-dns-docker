@@ -1,0 +1,38 @@
+# zones.example.yaml — Multi-zone RFC2136 configuration example
+#
+# Use this file with:
+#   external-dns-docker --rfc2136-config-file=/path/to/zones.yaml ...
+#
+# Each entry in `zones` configures one DNS zone managed by the daemon.
+# The daemon will fan-out Records() queries in parallel across all zones
+# and route DNS changes to the correct zone by longest-suffix match.
+#
+# Fields per zone:
+#   host            - RFC2136 server hostname or IP (required)
+#   port            - RFC2136 server port (default: 53)
+#   zone            - DNS zone to manage, trailing dot recommended (required)
+#   tsig-key        - TSIG key name (optional if server allows unsigned updates)
+#   tsig-secret     - TSIG secret, base64-encoded (mutually exclusive with tsig-secret-file)
+#   tsig-secret-file - Path to file containing base64 TSIG secret (mutually exclusive with tsig-secret)
+#   tsig-alg        - TSIG algorithm: hmac-sha256 (default), hmac-sha512, hmac-sha1
+#   min-ttl         - Minimum TTL in seconds to enforce on all records (0 = disabled)
+#   timeout         - Timeout for RFC2136 DNS operations, e.g. "10s" (default: 10s)
+
+zones:
+  # Zone 1: production zone on ns1.example.com
+  - host: ns1.example.com
+    port: 53
+    zone: example.com.
+    tsig-key: example-key
+    tsig-secret: "BASE64_ENCODED_SECRET_HERE"
+    tsig-alg: hmac-sha256
+    min-ttl: 0
+    timeout: 10s
+
+  # Zone 2: secondary zone with secret stored in a file (e.g. Docker secret)
+  - host: ns2.bke.ro
+    port: 53
+    zone: bke.ro.
+    tsig-key: bke-ro-key
+    tsig-secret-file: /run/secrets/bke_ro_tsig
+    tsig-alg: hmac-sha256
