@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"testing"
 	"time"
@@ -21,7 +22,7 @@ func TestNewLogger_Levels(t *testing.T) {
 		{"ERROR", slog.LevelError},
 		{"info", slog.LevelInfo},
 		{"INFO", slog.LevelInfo},
-		{"", slog.LevelInfo},    // unknown → default info
+		{"", slog.LevelInfo},      // unknown → default info
 		{"trace", slog.LevelInfo}, // unrecognised → default info
 	}
 	for _, tt := range tests {
@@ -29,12 +30,12 @@ func TestNewLogger_Levels(t *testing.T) {
 		if log == nil {
 			t.Errorf("newLogger(%q) returned nil", tt.input)
 		}
-		if !log.Enabled(nil, tt.want) {
+		if !log.Enabled(context.TODO(), tt.want) {
 			t.Errorf("newLogger(%q): level %v not enabled", tt.input, tt.want)
 		}
 		// One level above the configured level must not be enabled (except error,
 		// which is the maximum standard level).
-		if tt.want < slog.LevelError && log.Enabled(nil, tt.want-1) {
+		if tt.want < slog.LevelError && log.Enabled(context.TODO(), tt.want-1) {
 			t.Errorf("newLogger(%q): level below threshold (%v) should not be enabled", tt.input, tt.want-1)
 		}
 	}
