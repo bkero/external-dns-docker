@@ -12,25 +12,23 @@ linters:
     # Style / quality
     - misspell       # common misspellings
     - revive         # golint replacement
+  settings:
+    revive:
+      rules:
+        - name: exported
+          arguments:
+            - disableStutteringCheck
 
 formatters:
   enable:
     - gofmt
     - goimports
-
-formatters-settings:
-  gofmt:
-    simplify: true
-  goimports:
-    local-prefixes:
-      - github.com/bkero/external-dns-docker
-
-linters-settings:
-  revive:
-    rules:
-      - name: exported
-        arguments:
-          - disableStutteringCheck
+  settings:
+    gofmt:
+      simplify: true
+    goimports:
+      local-prefixes:
+        - github.com/bkero/external-dns-docker
 
 issues:
   max-issues-per-linter: 0
