@@ -284,7 +284,9 @@ func TestLoadZoneConfigsFromEnv_TSIGSecretFile_Resolved(t *testing.T) {
 	if _, err := f.WriteString(secret + "\n"); err != nil {
 		t.Fatal(err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	t.Setenv("EXTERNAL_DNS_RFC2136_ZONE_TEST_HOST", "ns1.example.com")
 	t.Setenv("EXTERNAL_DNS_RFC2136_ZONE_TEST_ZONE", "example.com.")
