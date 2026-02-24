@@ -1,0 +1,40 @@
+version: "2"
+
+linters:
+  default: none
+  enable:
+    # Core correctness
+    - errcheck       # unchecked errors
+    - govet          # go vet passes
+    - ineffassign    # ineffectual assignments
+    - staticcheck    # staticcheck suite
+    - unused         # unused code
+    # Style / quality
+    - misspell       # common misspellings
+    - revive         # golint replacement
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+formatters-settings:
+  gofmt:
+    simplify: true
+  goimports:
+    local-prefixes:
+      - github.com/bkero/external-dns-docker
+
+linters-settings:
+  revive:
+    rules:
+      - name: exported
+        arguments:
+          - disableStutteringCheck
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+run:
+  timeout: 5m
