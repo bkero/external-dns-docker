@@ -254,15 +254,15 @@ func startHealthServer(ctx context.Context, port int, metricsPath string, ctrl *
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintln(w, "ok")
+		_, _ = fmt.Fprintln(w, "ok")
 	})
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
 		if ctrl.IsReady() {
 			w.WriteHeader(http.StatusOK)
-			fmt.Fprintln(w, "ok")
+			_, _ = fmt.Fprintln(w, "ok")
 		} else {
 			w.WriteHeader(http.StatusServiceUnavailable)
-			fmt.Fprintln(w, "not ready")
+			_, _ = fmt.Fprintln(w, "not ready")
 		}
 	})
 	mux.Handle(metricsPath, promhttp.Handler())
