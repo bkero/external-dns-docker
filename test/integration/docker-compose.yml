@@ -25,5 +25,31 @@ services:
       retries: 20
       start_period: 3s
 
+  external-dns-docker:
+    # Build from the project root so we test the real binary.
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    # Run as root so the daemon can open /var/run/docker.sock.
+    # This is acceptable for a local integration-test environment.
+    user: "0:0"
+    command:
+      - --rfc2136-host=bind9
+      - --rfc2136-zone=example.com
+      - --rfc2136-tsig-key=external-dns-test
+      - --rfc2136-tsig-secret=dGVzdC1rZXktZm9yLWV4dGVybmFsLWRucy1kb2NrZXI=
+      - --rfc2136-tsig-alg=hmac-sha256
+      # Short interval and debounce so tests don't need to wait long.
+      - --interval=30s
+      - --debounce=500ms
+      - --log-level=debug
+    volumes:
+      # Share the host Docker socket so the daemon can watch test containers.
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      bind9:
+        condition: service_healthy
+    restart: on-failure
+
 volumes:
   bind9-cache:

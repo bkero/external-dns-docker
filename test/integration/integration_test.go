@@ -1,11 +1,14 @@
 //go:build integration
 
-// Package integration_test contains end-to-end tests that require a running
-// BIND9 server started via docker compose (see docker-compose.yml).
+// Package integration_test contains end-to-end tests that require the full
+// Docker Compose stack defined in docker-compose.yml to be running:
+//
+//   - bind9        — RFC2136-capable DNS server seeded with a manual record
+//   - external-dns-docker — the daemon under test, watching the host Docker socket
 //
 // Run with:
 //
-//	docker compose -f test/integration/docker-compose.yml up -d
+//	docker compose -f test/integration/docker-compose.yml up -d --build
 //	go test -v -tags integration ./test/integration/...
 //	docker compose -f test/integration/docker-compose.yml down -v
 package integration_test
@@ -13,49 +16,48 @@ package integration_test
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"testing"
 	"time"
 
+	"github.com/docker/docker/api/types/container"
+	dockerimage "github.com/docker/docker/api/types/image"
+	dockerclient "github.com/docker/docker/client"
 	"github.com/miekg/dns"
-
-	"github.com/bkero/external-dns-docker/pkg/controller"
-	"github.com/bkero/external-dns-docker/pkg/endpoint"
-	"github.com/bkero/external-dns-docker/pkg/provider/rfc2136"
-	fake_source "github.com/bkero/external-dns-docker/pkg/source/fake"
 )
 
 // ---- Test configuration ----
 
 const (
-	bindHost    = "127.0.0.1"
-	bindPort    = 5354
-	bindAddr    = "127.0.0.1:5354"
-	zone        = "example.com"
-	tsigKeyName = "external-dns-test"
-	// base64("test-key-for-external-dns-docker")
-	tsigSecret = "dGVzdC1rZXktZm9yLWV4dGVybmFsLWRucy1kb2NrZXI="
-	tsigAlg    = "hmac-sha256"
+	bindHost = "127.0.0.1"
+	bindPort = 5354
+	bindAddr = "127.0.0.1:5354"
+	zone     = "example.com"
+
+	// testImage is the minimal image used for ephemeral test containers.
+	// It must support the exec-form CMD ["sleep", "3600"].
+	testImage = "busybox:latest"
+
+	// reconcileTimeout is the maximum time to wait for external-dns-docker
+	// to react to a Docker event and update BIND9.
+	reconcileTimeout = 20 * time.Second
 )
 
-func providerCfg() rfc2136.Config {
-	return rfc2136.Config{
-		Host:          bindHost,
-		Port:          bindPort,
-		Zone:          zone,
-		TSIGKeyName:   tsigKeyName,
-		TSIGSecret:    tsigSecret,
-		TSIGSecretAlg: tsigAlg,
-	}
-}
-
-// ---- TestMain — wait for BIND9 before running tests ----
+// ---- TestMain — wait for the full stack before running tests ----
 
 func TestMain(m *testing.M) {
 	if !waitForBIND9(30 * time.Second) {
 		fmt.Fprintln(os.Stderr, "BIND9 not reachable at "+bindAddr+" — is docker compose up?")
 		os.Exit(1)
 	}
+	if err := ensureTestImage(); err != nil {
+		fmt.Fprintf(os.Stderr, "prepare test image %s: %v\n", testImage, err)
+		os.Exit(1)
+	}
+	// Give external-dns-docker time to connect to BIND9 and finish its
+	// initial reconciliation pass (should complete in < 1 s).
+	time.Sleep(5 * time.Second)
 	os.Exit(m.Run())
 }
 
@@ -75,22 +77,107 @@ func waitForBIND9(timeout time.Duration) bool {
 	return false
 }
 
-// ---- Helpers ----
+// ensureTestImage pulls testImage if it is not already present locally.
+func ensureTestImage() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
 
-// reconcileOnce runs one controller cycle with the given desired endpoints
-// against the test BIND9 server.
-func reconcileOnce(t *testing.T, desired []*endpoint.Endpoint) {
-	t.Helper()
-	src := fake_source.New(desired)
-	prov := rfc2136.New(providerCfg(), nil)
-	ctrl := controller.New(src, prov, nil, controller.Config{Once: true})
-	if err := ctrl.Run(context.Background()); err != nil {
-		t.Fatalf("controller.Run: %v", err)
+	cli, err := dockerclient.NewClientWithOpts(
+		dockerclient.FromEnv,
+		dockerclient.WithAPIVersionNegotiation(),
+	)
+	if err != nil {
+		return fmt.Errorf("docker client: %w", err)
 	}
+	defer cli.Close()
+
+	// Skip the pull if the image is already cached locally.
+	if _, _, err := cli.ImageInspectWithRaw(ctx, testImage); err == nil {
+		return nil
+	}
+
+	rc, err := cli.ImagePull(ctx, testImage, dockerimage.PullOptions{})
+	if err != nil {
+		return fmt.Errorf("pull %s: %w", testImage, err)
+	}
+	defer rc.Close()
+	_, err = io.Copy(io.Discard, rc)
+	return err
 }
 
-// queryA queries the test BIND9 server directly and returns all A record values
-// for the given fully-qualified domain name.
+// ---- Container helpers ----
+
+// newDockerClient returns a host-daemon Docker client that is closed
+// automatically when the test ends.
+func newDockerClient(t *testing.T) *dockerclient.Client {
+	t.Helper()
+	cli, err := dockerclient.NewClientWithOpts(
+		dockerclient.FromEnv,
+		dockerclient.WithAPIVersionNegotiation(),
+	)
+	if err != nil {
+		t.Fatalf("docker client: %v", err)
+	}
+	t.Cleanup(func() { cli.Close() })
+	return cli
+}
+
+// startLabeledContainer creates and starts a detached container carrying the
+// given labels. Docker auto-generates the container name. The container is
+// force-removed when the test ends.
+func startLabeledContainer(t *testing.T, labels map[string]string) string {
+	t.Helper()
+	ctx := context.Background()
+	cli := newDockerClient(t)
+
+	resp, err := cli.ContainerCreate(ctx,
+		&container.Config{
+			Image:  testImage,
+			Cmd:    []string{"sleep", "3600"},
+			Labels: labels,
+		},
+		nil, nil, nil, "", // hostConfig, networkConfig, platform, name
+	)
+	if err != nil {
+		t.Fatalf("ContainerCreate: %v", err)
+	}
+
+	t.Cleanup(func() {
+		cli.ContainerRemove(
+			context.Background(),
+			resp.ID,
+			container.RemoveOptions{Force: true},
+		)
+	})
+
+	if err := cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+		t.Fatalf("ContainerStart: %v", err)
+	}
+
+	t.Logf("started container %s", resp.ID[:12])
+	return resp.ID
+}
+
+// stopContainer immediately stops (but does not remove) the container.
+// external-dns-docker will react to the resulting Docker event and delete
+// the associated DNS records.
+func stopContainer(t *testing.T, id string) {
+	t.Helper()
+	cli := newDockerClient(t)
+	zero := 0
+	if err := cli.ContainerStop(
+		context.Background(),
+		id,
+		container.StopOptions{Timeout: &zero},
+	); err != nil {
+		t.Fatalf("ContainerStop %s: %v", id[:12], err)
+	}
+	t.Logf("stopped container %s", id[:12])
+}
+
+// ---- DNS helpers ----
+
+// queryA queries the test BIND9 server and returns all A record values for fqdn.
 func queryA(fqdn string) []string {
 	c := new(dns.Client)
 	m := new(dns.Msg)
@@ -108,72 +195,69 @@ func queryA(fqdn string) []string {
 	return ips
 }
 
-// assertARecord polls until fqdn has an A record pointing to wantIP, or fails
-// after a short deadline.
+// assertARecord polls until fqdn resolves to wantIP or reconcileTimeout expires.
 func assertARecord(t *testing.T, fqdn, wantIP string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(reconcileTimeout)
 	for time.Now().Before(deadline) {
 		for _, ip := range queryA(fqdn) {
 			if ip == wantIP {
 				return
 			}
 		}
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
 	}
-	t.Errorf("A record %s → %s not found (got %v)", fqdn, wantIP, queryA(fqdn))
+	t.Errorf("A record %s → %s not found after %v (got %v)",
+		fqdn, wantIP, reconcileTimeout, queryA(fqdn))
 }
 
-// assertNoARecord polls until fqdn has no A records, or fails after a deadline.
+// assertNoARecord polls until fqdn has no A records or reconcileTimeout expires.
 func assertNoARecord(t *testing.T, fqdn string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(reconcileTimeout)
 	for time.Now().Before(deadline) {
 		if len(queryA(fqdn)) == 0 {
 			return
 		}
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
 	}
-	t.Errorf("expected no A record for %s, but got %v", fqdn, queryA(fqdn))
+	t.Errorf("expected no A record for %s after %v, still got %v",
+		fqdn, reconcileTimeout, queryA(fqdn))
 }
 
 // ---- Tests ----
 
-// TestContainerStart_CreatesARecord verifies that when desired endpoints contain
-// a new hostname, reconciliation creates the corresponding A record in BIND9.
+// TestContainerStart_CreatesARecord verifies that starting a container with
+// external-dns.io labels causes external-dns-docker to create the A record.
 func TestContainerStart_CreatesARecord(t *testing.T) {
-	fqdn := "create-test.example.com"
+	fqdn := "e2e-create.example.com"
 
-	reconcileOnce(t, []*endpoint.Endpoint{
-		endpoint.New(fqdn, []string{"1.2.3.4"}, endpoint.RecordTypeA, 300, nil),
+	startLabeledContainer(t, map[string]string{
+		"external-dns.io/hostname": fqdn,
+		"external-dns.io/target":   "10.99.1.1",
 	})
 
-	assertARecord(t, fqdn, "1.2.3.4")
+	assertARecord(t, fqdn, "10.99.1.1")
 }
 
-// TestContainerStop_DeletesARecord verifies that when a previously-created record
-// is removed from desired endpoints, reconciliation deletes it from BIND9.
+// TestContainerStop_DeletesARecord verifies that stopping a container causes
+// external-dns-docker to delete the A record it previously created.
 func TestContainerStop_DeletesARecord(t *testing.T) {
-	fqdn := "delete-test.example.com"
+	fqdn := "e2e-delete.example.com"
 
-	// Setup: create the record first.
-	reconcileOnce(t, []*endpoint.Endpoint{
-		endpoint.New(fqdn, []string{"5.6.7.8"}, endpoint.RecordTypeA, 300, nil),
+	id := startLabeledContainer(t, map[string]string{
+		"external-dns.io/hostname": fqdn,
+		"external-dns.io/target":   "10.99.1.2",
 	})
-	assertARecord(t, fqdn, "5.6.7.8")
+	assertARecord(t, fqdn, "10.99.1.2")
 
-	// Teardown: reconcile with empty desired state — record should be deleted.
-	reconcileOnce(t, nil)
+	stopContainer(t, id)
 	assertNoARecord(t, fqdn)
 }
 
-// TestUnownedRecord_NotDeleted verifies that a DNS record that has no companion
-// ownership TXT record is never deleted by the daemon, even when it is absent
-// from the desired state.
+// TestUnownedRecord_NotDeleted verifies that a DNS record without a companion
+// ownership TXT record is never touched by external-dns-docker.
+// manual.example.com is seeded in the initial zone file with no ownership TXT.
 func TestUnownedRecord_NotDeleted(t *testing.T) {
-	// manual.example.com is seeded in the initial zone file with no ownership
-	// TXT record — external-dns-docker must leave it untouched.
-	reconcileOnce(t, nil) // empty desired state
-
 	assertARecord(t, "manual.example.com", "10.0.0.1")
 }
