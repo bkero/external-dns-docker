@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Pre-push hook: runs lint and unit-test CI jobs locally via act.
+# Install with: make install-hooks
+set -euo pipefail
+
+if ! command -v act &>/dev/null; then
+  echo "⚠  act not found — skipping local CI check." >&2
+  echo "   Install from https://github.com/nektos/act and re-run 'make install-hooks'." >&2
+  exit 0
+fi
+
+echo "==> Running lint job via act..."
+act push -j lint
+
+echo "==> Running unit-test job via act..."
+act push -j test
+
+echo "==> Local CI checks passed."

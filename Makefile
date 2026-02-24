@@ -7,7 +7,7 @@ IMAGE_TAG  ?= latest
 
 PLATFORMS  := linux/amd64,linux/arm64
 
-.PHONY: all build test lint docker clean
+.PHONY: all build test lint docker clean ci-act install-hooks
 
 all: build
 
@@ -46,6 +46,16 @@ docker-push:
 ## clean: remove build artifacts
 clean:
 	rm -rf $(BIN_DIR)
+
+## ci-act: run lint + unit-test CI jobs locally via act (requires Docker)
+ci-act:
+	act push -j lint
+	act push -j test
+
+## install-hooks: point git at the project-managed hooks in .github/hooks/
+install-hooks:
+	git config core.hooksPath .github/hooks
+	@echo "Git hooks installed. Pre-push will run lint + test via act."
 
 ## help: list available targets
 help:
