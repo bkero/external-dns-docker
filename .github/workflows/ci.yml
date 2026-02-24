@@ -184,7 +184,7 @@ jobs:
 
       - name: Scan pushed image for vulnerabilities
         if: github.event_name != 'pull_request'
-        uses: aquasecurity/trivy-action@0.30.0
+        uses: aquasecurity/trivy-action@0.34.1
         with:
           image-ref: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
           format: sarif
