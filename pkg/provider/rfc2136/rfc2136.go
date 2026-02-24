@@ -38,12 +38,12 @@ type Config struct {
 
 // Provider implements provider.Provider against an RFC2136-capable DNS server.
 type Provider struct {
-	cfg         Config
-	server      string // "host:port"
-	tsigAlg     string // normalised algorithm name (with trailing dot)
-	log         *slog.Logger
-	transferrer dnsTransferer
-	exchanger   dnsExchanger
+	cfg           Config
+	server        string // "host:port"
+	tsigAlg       string // normalised algorithm name (with trailing dot)
+	log           *slog.Logger
+	newTransferer func() dnsTransferer // factory: creates a fresh transferrer per Records() call
+	exchanger     dnsExchanger
 }
 
 // New returns a configured RFC2136 Provider.
@@ -66,8 +66,8 @@ func New(cfg Config, log *slog.Logger) *Provider {
 		server:  server,
 		tsigAlg: alg,
 		log:     log,
-		transferrer: &dns.Transfer{
-			TsigSecret: tsigSecret,
+		newTransferer: func() dnsTransferer {
+			return &dns.Transfer{TsigSecret: tsigSecret}
 		},
 		exchanger: &dns.Client{
 			Net:        "tcp",
@@ -85,12 +85,12 @@ func newWithDeps(cfg Config, log *slog.Logger, t dnsTransferer, e dnsExchanger) 
 		log = slog.Default()
 	}
 	return &Provider{
-		cfg:         cfg,
-		server:      fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
-		tsigAlg:     normaliseTSIGAlg(cfg.TSIGSecretAlg),
-		log:         log,
-		transferrer: t,
-		exchanger:   e,
+		cfg:           cfg,
+		server:        fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
+		tsigAlg:       normaliseTSIGAlg(cfg.TSIGSecretAlg),
+		log:           log,
+		newTransferer: func() dnsTransferer { return t },
+		exchanger:     e,
 	}
 }
 
@@ -102,7 +102,7 @@ func (p *Provider) Records(_ context.Context) ([]*endpoint.Endpoint, error) {
 		m.SetTsig(dns.Fqdn(p.cfg.TSIGKeyName), p.tsigAlg, 300, time.Now().Unix())
 	}
 
-	env, err := p.transferrer.In(m, p.server)
+	env, err := p.newTransferer().In(m, p.server)
 	if err != nil {
 		return nil, fmt.Errorf("axfr %s: %w", p.cfg.Zone, err)
 	}

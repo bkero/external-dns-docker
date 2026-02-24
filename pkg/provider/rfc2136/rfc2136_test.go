@@ -381,6 +381,16 @@ func TestNew_ExplicitPort(t *testing.T) {
 	}
 }
 
+func TestNew_TransfererFactory_ReturnsNonNil(t *testing.T) {
+	p := New(Config{Host: "ns1.example.com", Zone: "example.com"}, nil)
+	if p.newTransferer == nil {
+		t.Fatal("newTransferer factory is nil")
+	}
+	if p.newTransferer() == nil {
+		t.Error("newTransferer() returned nil")
+	}
+}
+
 // --- normaliseTSIGAlg tests ---
 
 func TestNormaliseTSIGAlg(t *testing.T) {
