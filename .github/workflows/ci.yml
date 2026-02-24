@@ -10,6 +10,7 @@ on:
 permissions:
   contents: write
   packages: write
+  security-events: write  # for SARIF uploads to the Security tab
 
 jobs:
   # -----------------------------------------------------------------------
@@ -33,7 +34,7 @@ jobs:
           args: --timeout 5m
 
   # -----------------------------------------------------------------------
-  # Unit tests
+  # Unit tests + coverage gate
   # -----------------------------------------------------------------------
   test:
     name: Unit Tests
@@ -47,6 +48,12 @@ jobs:
 
       - name: Run unit tests
         run: go test -race -coverprofile=coverage.out ./...
+
+      - name: Check coverage threshold (80%)
+        run: |
+          TOTAL=$(go tool cover -func=coverage.out | awk '/^total:/{print $3}' | tr -d '%')
+          echo "Total coverage: ${TOTAL}%"
+          awk -v c="$TOTAL" 'BEGIN { if (c+0 < 80) { print "FAIL: coverage " c "% is below the 80% threshold"; exit 1 } }'
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
@@ -81,7 +88,54 @@ jobs:
           fi
 
   # -----------------------------------------------------------------------
-  # Docker build (PR: build only; main/tags: build + push)
+  # Vulnerability scanning
+  #   govulncheck — Go module vulnerability database (hard gate)
+  #   gosec       — Go security linter (SARIF → Security tab)
+  # -----------------------------------------------------------------------
+  vuln:
+    name: Vulnerability Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: govulncheck
+        uses: golang/govulncheck-action@v1
+        with:
+          go-version-file: go.mod
+          go-package: ./...
+
+      - name: gosec security scanner
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          gosec -fmt sarif -out gosec-results.sarif ./... || true
+
+      - name: Upload gosec results to Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: gosec-results.sarif
+          category: gosec
+
+  # -----------------------------------------------------------------------
+  # Dependency review — flags newly introduced vulnerable deps on PRs
+  # -----------------------------------------------------------------------
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+
+  # -----------------------------------------------------------------------
+  # Docker build (PR: build only; main/tags: build + push + image scan)
   # -----------------------------------------------------------------------
   docker:
     name: Docker Build
@@ -117,6 +171,7 @@ jobs:
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
       - name: Build (and push on non-PR)
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -126,6 +181,23 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Scan pushed image for vulnerabilities
+        if: github.event_name != 'pull_request'
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          image-ref: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+          format: sarif
+          output: trivy-image-results.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+      - name: Upload Trivy image scan results to Security tab
+        if: github.event_name != 'pull_request'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image-results.sarif
+          category: trivy-image
 
   # -----------------------------------------------------------------------
   # Semantic release — runs on push to main after all checks pass
