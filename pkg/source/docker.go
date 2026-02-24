@@ -12,9 +12,16 @@ import (
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
 	dockerclient "github.com/docker/docker/client"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/bkero/external-dns-docker/pkg/endpoint"
 )
+
+var dockerEventsTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "external_dns_docker_docker_events_total",
+	Help: "Total number of Docker container lifecycle events received.",
+})
 
 const (
 	labelPrefix     = "external-dns.io/"
@@ -138,6 +145,7 @@ func (s *DockerSource) runEventLoop(ctx context.Context) {
 }
 
 func (s *DockerSource) notify() {
+	dockerEventsTotal.Inc()
 	for _, h := range s.handlers {
 		h()
 	}

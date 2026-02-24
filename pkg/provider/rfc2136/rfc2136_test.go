@@ -595,6 +595,49 @@ func TestRRToEndpoint_TrailingDotStripped(t *testing.T) {
 	}
 }
 
+// --- Preflight tests ---
+
+func TestPreflight_Success(t *testing.T) {
+	me := &mockExchanger{resp: successResp()}
+	p := testProvider(nil, me)
+	if err := p.Preflight(context.Background()); err != nil {
+		t.Fatalf("Preflight() error = %v", err)
+	}
+}
+
+func TestPreflight_ExchangeError(t *testing.T) {
+	me := &mockExchanger{err: fmt.Errorf("connection refused")}
+	p := testProvider(nil, me)
+	if err := p.Preflight(context.Background()); err == nil {
+		t.Error("expected error from exchange failure, got nil")
+	}
+}
+
+func TestPreflight_NonSuccessRcode(t *testing.T) {
+	resp := new(dns.Msg)
+	resp.Rcode = dns.RcodeNotAuth
+	me := &mockExchanger{resp: resp}
+	p := testProvider(nil, me)
+	err := p.Preflight(context.Background())
+	if err == nil {
+		t.Error("expected error for NOTAUTH rcode, got nil")
+	}
+}
+
+func TestPreflight_NoTSIG_SendsPlainQuery(t *testing.T) {
+	me := &mockExchanger{resp: successResp()}
+	p := newWithDeps(Config{Host: "ns1.example.com", Port: 53, Zone: "example.com"}, nil, nil, me)
+	if err := p.Preflight(context.Background()); err != nil {
+		t.Fatalf("Preflight() without TSIG error = %v", err)
+	}
+	if me.sent == nil {
+		t.Fatal("expected Exchange to be called")
+	}
+	if me.sent.IsTsig() != nil {
+		t.Error("expected no TSIG on query when no key is configured")
+	}
+}
+
 // --- Timeout and context tests ---
 
 func TestNew_TimeoutSetOnClient(t *testing.T) {

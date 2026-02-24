@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/bkero/external-dns-docker/pkg/endpoint"
 	"github.com/bkero/external-dns-docker/pkg/plan"
 	fake_provider "github.com/bkero/external-dns-docker/pkg/provider/fake"
@@ -65,6 +67,55 @@ func (p *errApplyProvider) ApplyChanges(_ context.Context, _ *plan.Changes) erro
 	return p.err
 }
 
+// --- Prometheus metrics ---
+
+func TestReconcile_MetricsIncrementOnSuccess(t *testing.T) {
+	before := testutil.ToFloat64(reconciliationsTotal.WithLabelValues("success"))
+
+	src := fake_source.New([]*endpoint.Endpoint{ep("app.example.com", "1.2.3.4")})
+	prov := fake_provider.New(nil)
+	c := New(src, prov, slog.Default(), Config{Once: true})
+	if err := c.Run(context.Background()); err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	after := testutil.ToFloat64(reconciliationsTotal.WithLabelValues("success"))
+	if after <= before {
+		t.Errorf("reconciliations_total{result=success} did not increment: before=%v after=%v", before, after)
+	}
+}
+
+func TestReconcile_MetricsIncrementOnError(t *testing.T) {
+	before := testutil.ToFloat64(reconciliationsTotal.WithLabelValues("error"))
+
+	src := &errSource{err: errors.New("docker unavailable")}
+	prov := fake_provider.New(nil)
+	c := New(src, prov, slog.Default(), Config{Once: true})
+	_ = c.Run(context.Background())
+
+	after := testutil.ToFloat64(reconciliationsTotal.WithLabelValues("error"))
+	if after <= before {
+		t.Errorf("reconciliations_total{result=error} did not increment: before=%v after=%v", before, after)
+	}
+}
+
+func TestReconcile_RecordsManagedGauge(t *testing.T) {
+	src := fake_source.New([]*endpoint.Endpoint{
+		ep("a.example.com", "1.1.1.1"),
+		ep("b.example.com", "2.2.2.2"),
+	})
+	prov := fake_provider.New(nil)
+	c := New(src, prov, slog.Default(), Config{Once: true})
+	if err := c.Run(context.Background()); err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	got := testutil.ToFloat64(recordsManaged)
+	if got != 2 {
+		t.Errorf("records_managed = %v, want 2", got)
+	}
+}
+
 // --- applyDefaults ---
 
 func TestApplyDefaults_FillsZeroValues(t *testing.T) {
@@ -76,12 +127,20 @@ func TestApplyDefaults_FillsZeroValues(t *testing.T) {
 	if cfg.DebounceDuration != 5*time.Second {
 		t.Errorf("DebounceDuration = %v, want 5s", cfg.DebounceDuration)
 	}
+	if cfg.BackoffBase != 5*time.Second {
+		t.Errorf("BackoffBase = %v, want 5s", cfg.BackoffBase)
+	}
+	if cfg.BackoffMax != 5*time.Minute {
+		t.Errorf("BackoffMax = %v, want 5m", cfg.BackoffMax)
+	}
 }
 
 func TestApplyDefaults_PreservesNonZero(t *testing.T) {
 	cfg := Config{
 		Interval:         30 * time.Second,
 		DebounceDuration: 2 * time.Second,
+		BackoffBase:      1 * time.Second,
+		BackoffMax:       1 * time.Minute,
 	}
 	cfg.applyDefaults()
 	if cfg.Interval != 30*time.Second {
@@ -90,7 +149,95 @@ func TestApplyDefaults_PreservesNonZero(t *testing.T) {
 	if cfg.DebounceDuration != 2*time.Second {
 		t.Errorf("DebounceDuration = %v, want 2s", cfg.DebounceDuration)
 	}
+	if cfg.BackoffBase != 1*time.Second {
+		t.Errorf("BackoffBase = %v, want 1s", cfg.BackoffBase)
+	}
+	if cfg.BackoffMax != 1*time.Minute {
+		t.Errorf("BackoffMax = %v, want 1m", cfg.BackoffMax)
+	}
 }
+
+// --- backoffDuration ---
+
+func TestBackoffDuration_FirstFailure(t *testing.T) {
+	c := New(fake_source.New(nil), fake_provider.New(nil), slog.Default(), Config{
+		BackoffBase: 5 * time.Second,
+		BackoffMax:  5 * time.Minute,
+	})
+	if got := c.backoffDuration(1); got != 5*time.Second {
+		t.Errorf("backoffDuration(1) = %v, want 5s", got)
+	}
+}
+
+func TestBackoffDuration_Doubles(t *testing.T) {
+	c := New(fake_source.New(nil), fake_provider.New(nil), slog.Default(), Config{
+		BackoffBase: 5 * time.Second,
+		BackoffMax:  5 * time.Minute,
+	})
+	if got := c.backoffDuration(2); got != 10*time.Second {
+		t.Errorf("backoffDuration(2) = %v, want 10s", got)
+	}
+	if got := c.backoffDuration(3); got != 20*time.Second {
+		t.Errorf("backoffDuration(3) = %v, want 20s", got)
+	}
+}
+
+func TestBackoffDuration_CapsAtMax(t *testing.T) {
+	c := New(fake_source.New(nil), fake_provider.New(nil), slog.Default(), Config{
+		BackoffBase: 5 * time.Second,
+		BackoffMax:  5 * time.Minute,
+	})
+	got := c.backoffDuration(100)
+	if got != 5*time.Minute {
+		t.Errorf("backoffDuration(100) = %v, want 5m (max)", got)
+	}
+}
+
+func TestRun_BackoffResetOnSuccess(t *testing.T) {
+	// errSource fails once then succeeds; verify the loop continues to run
+	// reconciles (i.e. it didn't get stuck waiting on a long backoff).
+	callCount := 0
+	src := &countingErrSource{failFirst: 1, onCall: func() { callCount++ }}
+	prov := fake_provider.New(nil)
+	c := New(src, prov, slog.Default(), Config{
+		Interval:    5 * time.Millisecond,
+		BackoffBase: 1 * time.Millisecond, // tiny backoff for test speed
+		BackoffMax:  10 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- c.Run(ctx) }()
+
+	// Allow time for initial fail + backoff + success + second interval + success
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	<-errCh
+
+	if callCount < 2 {
+		t.Errorf("expected at least 2 reconcile calls (fail then succeed), got %d", callCount)
+	}
+}
+
+// countingErrSource fails its first N Endpoints calls then succeeds.
+type countingErrSource struct {
+	failFirst int
+	calls     int
+	onCall    func()
+}
+
+func (s *countingErrSource) Endpoints(_ context.Context) ([]*endpoint.Endpoint, error) {
+	s.calls++
+	if s.onCall != nil {
+		s.onCall()
+	}
+	if s.calls <= s.failFirst {
+		return nil, errors.New("transient error")
+	}
+	return nil, nil
+}
+
+func (s *countingErrSource) AddEventHandler(_ context.Context, _ func()) {}
 
 // --- Once mode ---
 

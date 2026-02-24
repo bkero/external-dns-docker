@@ -102,6 +102,26 @@ func newWithDeps(cfg Config, log *slog.Logger, t dnsTransferer, e dnsExchanger) 
 	}
 }
 
+// Preflight validates connectivity and TSIG credentials by sending a SOA query
+// to the configured DNS server. Returns an error if the server is unreachable
+// or responds with a non-success rcode (e.g. NOTAUTH on bad TSIG).
+func (p *Provider) Preflight(ctx context.Context) error {
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(p.cfg.Zone), dns.TypeSOA)
+	if p.cfg.TSIGKeyName != "" {
+		m.SetTsig(dns.Fqdn(p.cfg.TSIGKeyName), p.tsigAlg, 300, time.Now().Unix())
+	}
+	r, _, err := p.exchanger.ExchangeContext(ctx, m, p.server)
+	if err != nil {
+		return fmt.Errorf("preflight SOA query to %s failed: %w", p.server, err)
+	}
+	if r.Rcode != dns.RcodeSuccess {
+		return fmt.Errorf("preflight SOA query failed: rcode %s (%d) — check --rfc2136-host and TSIG credentials",
+			dns.RcodeToString[r.Rcode], r.Rcode)
+	}
+	return nil
+}
+
 // Records fetches the current zone contents via AXFR and returns them as Endpoints.
 func (p *Provider) Records(ctx context.Context) ([]*endpoint.Endpoint, error) {
 	m := new(dns.Msg)

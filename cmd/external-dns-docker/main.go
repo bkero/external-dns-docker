@@ -18,6 +18,7 @@ import (
 	"time"
 
 	dockerclient "github.com/docker/docker/client"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/bkero/external-dns-docker/pkg/controller"
 	"github.com/bkero/external-dns-docker/pkg/provider/rfc2136"
@@ -82,10 +83,24 @@ func main() {
 		envOr("EXTERNAL_DNS_OWNER_ID", ""),
 		"Ownership identifier written to TXT records (default: external-dns-docker)")
 
+	skipPreflight := flag.Bool("skip-preflight",
+		envOrBool("EXTERNAL_DNS_SKIP_PREFLIGHT", false),
+		"Skip the startup DNS connectivity and TSIG credential check")
+
+	backoffBase := flag.Duration("reconcile-backoff-base",
+		envOrDuration("EXTERNAL_DNS_RECONCILE_BACKOFF_BASE", 5*time.Second),
+		"Base duration for exponential backoff on consecutive reconciliation failures")
+	backoffMax := flag.Duration("reconcile-backoff-max",
+		envOrDuration("EXTERNAL_DNS_RECONCILE_BACKOFF_MAX", 5*time.Minute),
+		"Maximum backoff duration for reconciliation failures")
+
 	// ---- Health check flags ----
 	healthPort := flag.Int("health-port",
 		envOrInt("EXTERNAL_DNS_HEALTH_PORT", 8080),
 		"Port for the HTTP health check server (0 to disable)")
+	metricsPath := flag.String("metrics-path",
+		envOr("EXTERNAL_DNS_METRICS_PATH", "/metrics"),
+		"HTTP path for Prometheus metrics endpoint")
 
 	// ---- Shutdown flags ----
 	shutdownTimeout := flag.Duration("shutdown-timeout",
@@ -144,10 +159,23 @@ func main() {
 		Timeout:       *rfc2136Timeout,
 	}, log)
 
+	// ---- Preflight DNS connectivity check ----
+	if !*skipPreflight {
+		preflightCtx, preflightCancel := context.WithTimeout(context.Background(), *rfc2136Timeout)
+		defer preflightCancel()
+		if err := prov.Preflight(preflightCtx); err != nil {
+			log.Error("DNS preflight check failed — use --skip-preflight to bypass", "err", err)
+			os.Exit(1)
+		}
+		log.Info("DNS preflight check passed")
+	}
+
 	// ---- Build controller ----
 	ctrl := controller.New(src, prov, log, controller.Config{
 		Interval:         *interval,
 		DebounceDuration: *debounce,
+		BackoffBase:      *backoffBase,
+		BackoffMax:       *backoffMax,
 		DryRun:           *dryRun,
 		Once:             *once,
 		OwnerID:          *ownerID,
@@ -158,7 +186,7 @@ func main() {
 	defer stop()
 
 	// ---- Health check server ----
-	startHealthServer(ctx, *healthPort, ctrl, log)
+	startHealthServer(ctx, *healthPort, *metricsPath, ctrl, log)
 
 	// Start the Docker event watcher in the background (not needed for once mode).
 	var watchWg sync.WaitGroup
@@ -198,10 +226,10 @@ func main() {
 	}
 }
 
-// startHealthServer starts an HTTP server exposing /healthz (liveness) and
-// /readyz (readiness) on the given port. A port of 0 disables the server.
-// The server is shut down gracefully when ctx is cancelled.
-func startHealthServer(ctx context.Context, port int, ctrl *controller.Controller, log *slog.Logger) {
+// startHealthServer starts an HTTP server exposing /healthz (liveness),
+// /readyz (readiness), and a Prometheus metrics endpoint on the given port.
+// A port of 0 disables the server. The server shuts down when ctx is cancelled.
+func startHealthServer(ctx context.Context, port int, metricsPath string, ctrl *controller.Controller, log *slog.Logger) {
 	if port == 0 {
 		return
 	}
@@ -219,6 +247,7 @@ func startHealthServer(ctx context.Context, port int, ctrl *controller.Controlle
 			fmt.Fprintln(w, "not ready")
 		}
 	})
+	mux.Handle(metricsPath, promhttp.Handler())
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%d", port),
 		Handler: mux,
@@ -232,7 +261,7 @@ func startHealthServer(ctx context.Context, port int, ctrl *controller.Controlle
 		}
 	}()
 	go func() {
-		log.Info("health server listening", "port", port)
+		log.Info("health server listening", "port", port, "metrics", metricsPath)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("health server error", "err", err)
 		}

@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -177,22 +178,56 @@ func stopContainer(t *testing.T, id string) {
 
 // ---- DNS helpers ----
 
-// queryA queries the test BIND9 server and returns all A record values for fqdn.
-func queryA(fqdn string) []string {
+// query sends a DNS query of the given type and returns the answer section.
+func query(fqdn string, qtype uint16) []dns.RR {
 	c := new(dns.Client)
 	m := new(dns.Msg)
-	m.SetQuestion(dns.Fqdn(fqdn), dns.TypeA)
+	m.SetQuestion(dns.Fqdn(fqdn), qtype)
 	r, _, err := c.Exchange(m, bindAddr)
 	if err != nil || r.Rcode != dns.RcodeSuccess {
 		return nil
 	}
+	return r.Answer
+}
+
+// queryA queries the test BIND9 server and returns all A record values for fqdn.
+func queryA(fqdn string) []string {
 	var ips []string
-	for _, rr := range r.Answer {
+	for _, rr := range query(fqdn, dns.TypeA) {
 		if a, ok := rr.(*dns.A); ok {
 			ips = append(ips, a.A.String())
 		}
 	}
 	return ips
+}
+
+// queryAAAA returns all AAAA record values for fqdn.
+func queryAAAA(fqdn string) []string {
+	var ips []string
+	for _, rr := range query(fqdn, dns.TypeAAAA) {
+		if aaaa, ok := rr.(*dns.AAAA); ok {
+			ips = append(ips, aaaa.AAAA.String())
+		}
+	}
+	return ips
+}
+
+// queryCNAME returns the CNAME target for fqdn (empty string if none).
+func queryCNAME(fqdn string) string {
+	for _, rr := range query(fqdn, dns.TypeCNAME) {
+		if cname, ok := rr.(*dns.CNAME); ok {
+			return strings.TrimSuffix(cname.Target, ".")
+		}
+	}
+	return ""
+}
+
+// queryTTL returns the TTL of the first A record for fqdn, or -1 if not found.
+func queryTTL(fqdn string) int64 {
+	for _, rr := range query(fqdn, dns.TypeA) {
+		return int64(rr.Header().Ttl)
+	}
+	return -1
 }
 
 // assertARecord polls until fqdn resolves to wantIP or reconcileTimeout expires.
@@ -209,6 +244,50 @@ func assertARecord(t *testing.T, fqdn, wantIP string) {
 	}
 	t.Errorf("A record %s → %s not found after %v (got %v)",
 		fqdn, wantIP, reconcileTimeout, queryA(fqdn))
+}
+
+// assertAAAARecord polls until fqdn resolves to wantIP (AAAA) or reconcileTimeout expires.
+func assertAAAARecord(t *testing.T, fqdn, wantIP string) {
+	t.Helper()
+	deadline := time.Now().Add(reconcileTimeout)
+	for time.Now().Before(deadline) {
+		for _, ip := range queryAAAA(fqdn) {
+			if ip == wantIP {
+				return
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	t.Errorf("AAAA record %s → %s not found after %v (got %v)",
+		fqdn, wantIP, reconcileTimeout, queryAAAA(fqdn))
+}
+
+// assertCNAMERecord polls until fqdn has a CNAME pointing to wantTarget.
+func assertCNAMERecord(t *testing.T, fqdn, wantTarget string) {
+	t.Helper()
+	deadline := time.Now().Add(reconcileTimeout)
+	for time.Now().Before(deadline) {
+		if queryCNAME(fqdn) == wantTarget {
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	t.Errorf("CNAME record %s → %s not found after %v (got %q)",
+		fqdn, wantTarget, reconcileTimeout, queryCNAME(fqdn))
+}
+
+// assertTTL polls until fqdn's A record has the given TTL.
+func assertTTL(t *testing.T, fqdn string, wantTTL int64) {
+	t.Helper()
+	deadline := time.Now().Add(reconcileTimeout)
+	for time.Now().Before(deadline) {
+		if got := queryTTL(fqdn); got == wantTTL {
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	t.Errorf("A record %s TTL = %d, want %d after %v",
+		fqdn, queryTTL(fqdn), wantTTL, reconcileTimeout)
 }
 
 // assertNoARecord polls until fqdn has no A records or reconcileTimeout expires.
@@ -260,4 +339,153 @@ func TestContainerStop_DeletesARecord(t *testing.T) {
 // manual.example.com is seeded in the initial zone file with no ownership TXT.
 func TestUnownedRecord_NotDeleted(t *testing.T) {
 	assertARecord(t, "manual.example.com", "10.0.0.1")
+}
+
+// TestContainerStart_CreatesAAAARecord verifies that an IPv6 target produces
+// an AAAA record via RFC2136 dynamic update.
+func TestContainerStart_CreatesAAAARecord(t *testing.T) {
+	fqdn := "e2e-aaaa.example.com"
+
+	startLabeledContainer(t, map[string]string{
+		"external-dns.io/hostname": fqdn,
+		"external-dns.io/target":   "2001:db8::99",
+	})
+
+	assertAAAARecord(t, fqdn, "2001:db8::99")
+}
+
+// TestContainerStart_CreatesCNAMERecord verifies that a hostname target
+// (not an IP address) produces a CNAME record.
+func TestContainerStart_CreatesCNAMERecord(t *testing.T) {
+	fqdn := "e2e-cname.example.com"
+	target := "backend.example.com"
+
+	startLabeledContainer(t, map[string]string{
+		"external-dns.io/hostname": fqdn,
+		"external-dns.io/target":   target,
+	})
+
+	assertCNAMERecord(t, fqdn, target)
+}
+
+// TestTTLLabel_Respected verifies that the external-dns.io/ttl label sets
+// the TTL of the created DNS record.
+func TestTTLLabel_Respected(t *testing.T) {
+	fqdn := "e2e-ttl.example.com"
+
+	startLabeledContainer(t, map[string]string{
+		"external-dns.io/hostname": fqdn,
+		"external-dns.io/target":   "10.99.3.1",
+		"external-dns.io/ttl":      "60",
+	})
+
+	assertARecord(t, fqdn, "10.99.3.1")
+	assertTTL(t, fqdn, 60)
+}
+
+// TestMultipleContainers_SameHostname verifies that two containers carrying
+// the same hostname label do not cause a crash and that at least one A record
+// is created (behaviour for duplicate names is last-writer-wins in the plan).
+func TestMultipleContainers_SameHostname(t *testing.T) {
+	fqdn := "e2e-multi.example.com"
+
+	startLabeledContainer(t, map[string]string{
+		"external-dns.io/hostname": fqdn,
+		"external-dns.io/target":   "10.99.4.1",
+	})
+	startLabeledContainer(t, map[string]string{
+		"external-dns.io/hostname": fqdn,
+		"external-dns.io/target":   "10.99.4.2",
+	})
+
+	// At least one of the two IPs should appear — the daemon must not crash.
+	deadline := time.Now().Add(reconcileTimeout)
+	for time.Now().Before(deadline) {
+		ips := queryA(fqdn)
+		for _, ip := range ips {
+			if ip == "10.99.4.1" || ip == "10.99.4.2" {
+				return
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	t.Errorf("expected at least one A record for %s after %v", fqdn, reconcileTimeout)
+}
+
+// TestContainerRestart_RecordPreserved verifies that stopping and restarting
+// a container causes the A record to be deleted and then re-created.
+func TestContainerRestart_RecordPreserved(t *testing.T) {
+	fqdn := "e2e-restart.example.com"
+	ip := "10.99.5.1"
+
+	cli := newDockerClient(t)
+	ctx := context.Background()
+
+	// Start container — record created.
+	resp, err := cli.ContainerCreate(ctx,
+		&container.Config{
+			Image: testImage,
+			Cmd:   []string{"sleep", "3600"},
+			Labels: map[string]string{
+				"external-dns.io/hostname": fqdn,
+				"external-dns.io/target":   ip,
+			},
+		},
+		nil, nil, nil, "",
+	)
+	if err != nil {
+		t.Fatalf("ContainerCreate: %v", err)
+	}
+	t.Cleanup(func() {
+		cli.ContainerRemove(context.Background(), resp.ID, container.RemoveOptions{Force: true})
+	})
+
+	if err := cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+		t.Fatalf("ContainerStart: %v", err)
+	}
+	assertARecord(t, fqdn, ip)
+
+	// Stop — record deleted.
+	zero := 0
+	if err := cli.ContainerStop(ctx, resp.ID, container.StopOptions{Timeout: &zero}); err != nil {
+		t.Fatalf("ContainerStop: %v", err)
+	}
+	assertNoARecord(t, fqdn)
+
+	// Restart — record re-created.
+	if err := cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+		t.Fatalf("ContainerStart (restart): %v", err)
+	}
+	assertARecord(t, fqdn, ip)
+}
+
+// TestInvalidTarget_ContainerSkipped verifies that a container with an
+// invalid A-record target (a non-IP value with explicit record-type=A) is
+// skipped by the provider without crashing the daemon, and that subsequent
+// valid containers continue to work.
+func TestInvalidTarget_ContainerSkipped(t *testing.T) {
+	// Start a container with an invalid target for an explicit A record.
+	// The RFC2136 provider will warn and skip this endpoint.
+	startLabeledContainer(t, map[string]string{
+		"external-dns.io/hostname":    "e2e-invalid.example.com",
+		"external-dns.io/target":      "not-a-valid-ip",
+		"external-dns.io/record-type": "A",
+	})
+
+	// Give the daemon time to process the invalid container.
+	time.Sleep(3 * time.Second)
+
+	// The invalid container must not produce any A record.
+	if ips := queryA("e2e-invalid.example.com"); len(ips) > 0 {
+		t.Errorf("expected no A record for invalid target, got %v", ips)
+	}
+
+	// The daemon must still be running — a valid container started after the
+	// invalid one should produce its record normally.
+	fqdn := "e2e-after-invalid.example.com"
+	startLabeledContainer(t, map[string]string{
+		"external-dns.io/hostname": fqdn,
+		"external-dns.io/target":   "10.99.6.1",
+	})
+	assertARecord(t, fqdn, "10.99.6.1")
 }
