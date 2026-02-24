@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bkero/external-dns-docker/pkg/plan"
@@ -46,6 +47,13 @@ type Controller struct {
 	plan     *plan.Plan
 	log      *slog.Logger
 	cfg      Config
+	ready    atomic.Bool // set true after first successful reconcile
+}
+
+// IsReady reports whether at least one reconciliation cycle has completed successfully.
+// Used by the health server to gate the readiness endpoint.
+func (c *Controller) IsReady() bool {
+	return c.ready.Load()
 }
 
 // New returns a Controller wired with the given source, provider, and config.
@@ -118,7 +126,13 @@ func (c *Controller) Run(ctx context.Context) error {
 }
 
 // reconcile executes one full fetch → diff → apply cycle.
-func (c *Controller) reconcile(ctx context.Context) error {
+func (c *Controller) reconcile(ctx context.Context) (retErr error) {
+	defer func() {
+		if retErr == nil {
+			c.ready.Store(true)
+		}
+	}()
+
 	desired, err := c.source.Endpoints(ctx)
 	if err != nil {
 		return fmt.Errorf("fetch desired endpoints: %w", err)

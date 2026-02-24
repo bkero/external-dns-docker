@@ -29,6 +29,7 @@ const (
 type dockerAPI interface {
 	ContainerList(ctx context.Context, options container.ListOptions) ([]container.Summary, error)
 	Events(ctx context.Context, options events.ListOptions) (<-chan events.Message, <-chan error)
+	Close() error
 }
 
 // DockerSource implements Source by watching the Docker daemon.
@@ -67,6 +68,11 @@ func newDockerSourceWithClient(client dockerAPI, log *slog.Logger) *DockerSource
 		log = slog.Default()
 	}
 	return &DockerSource{client: client, log: log, reconnectWait: 0}
+}
+
+// Close releases resources held by the DockerSource, including the underlying Docker client connection.
+func (s *DockerSource) Close() error {
+	return s.client.Close()
 }
 
 // Endpoints lists running containers and extracts DNS endpoints from their labels.

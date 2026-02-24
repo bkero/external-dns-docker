@@ -38,6 +38,8 @@ func (m *mockDockerClient) Events(_ context.Context, _ events.ListOptions) (<-ch
 	return m.eventCh, m.errCh
 }
 
+func (m *mockDockerClient) Close() error { return nil }
+
 func newTestSource(containers []container.Summary) (*DockerSource, *mockDockerClient) {
 	mock := newMockClient(containers)
 	log := slog.Default()
@@ -437,6 +439,8 @@ func (m *reconnectMockClient) ContainerList(_ context.Context, _ container.ListO
 	return nil, nil
 }
 
+func (m *reconnectMockClient) Close() error { return nil }
+
 func (m *reconnectMockClient) Events(_ context.Context, _ events.ListOptions) (<-chan events.Message, <-chan error) {
 	m.calls++
 	if m.calls == 1 {
@@ -536,6 +540,15 @@ func TestDockerSource_LongContainerID_Truncated(t *testing.T) {
 	}
 	if eps[0].DNSName != "app.example.com" {
 		t.Errorf("DNSName = %q, want app.example.com", eps[0].DNSName)
+	}
+}
+
+// --- Close ---
+
+func TestDockerSource_Close_NoError(t *testing.T) {
+	src, _ := newTestSource(nil)
+	if err := src.Close(); err != nil {
+		t.Errorf("Close() error = %v, want nil", err)
 	}
 }
 

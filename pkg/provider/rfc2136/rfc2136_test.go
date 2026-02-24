@@ -2,6 +2,7 @@ package rfc2136
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"testing"
@@ -39,7 +40,7 @@ type mockExchanger struct {
 	sent *dns.Msg
 }
 
-func (m *mockExchanger) Exchange(msg *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+func (m *mockExchanger) ExchangeContext(_ context.Context, msg *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
 	m.sent = msg
 	if m.err != nil {
 		return nil, 0, m.err
@@ -591,5 +592,51 @@ func TestRRToEndpoint_TrailingDotStripped(t *testing.T) {
 	}
 	if ep.DNSName != "app.example.com" {
 		t.Errorf("DNSName = %q, want no trailing dot", ep.DNSName)
+	}
+}
+
+// --- Timeout and context tests ---
+
+func TestNew_TimeoutSetOnClient(t *testing.T) {
+	p := New(Config{Host: "ns1.example.com", Zone: "example.com", Timeout: 5 * time.Second}, nil)
+	client, ok := p.exchanger.(*dns.Client)
+	if !ok {
+		t.Fatal("exchanger is not *dns.Client")
+	}
+	if client.Timeout != 5*time.Second {
+		t.Errorf("Timeout = %v, want 5s", client.Timeout)
+	}
+}
+
+func TestNew_DefaultTimeout(t *testing.T) {
+	p := New(Config{Host: "ns1.example.com", Zone: "example.com"}, nil)
+	client, ok := p.exchanger.(*dns.Client)
+	if !ok {
+		t.Fatal("exchanger is not *dns.Client")
+	}
+	if client.Timeout != defaultTimeout {
+		t.Errorf("Default timeout = %v, want %v", client.Timeout, defaultTimeout)
+	}
+}
+
+// blockingTransferer returns a channel that never delivers envelopes, simulating a hung AXFR.
+type blockingTransferer struct{}
+
+func (b *blockingTransferer) In(_ *dns.Msg, _ string) (chan *dns.Envelope, error) {
+	return make(chan *dns.Envelope), nil // never closes or sends
+}
+
+func TestRecords_ContextCancelled(t *testing.T) {
+	p := newWithDeps(Config{Host: "ns1", Port: 53, Zone: "example.com"}, nil, &blockingTransferer{}, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled
+
+	_, err := p.Records(ctx)
+	if err == nil {
+		t.Fatal("expected error when context is cancelled, got nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled, got %v", err)
 	}
 }

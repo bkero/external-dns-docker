@@ -6,11 +6,14 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -44,6 +47,9 @@ func main() {
 	rfc2136MinTTL := flag.Int64("rfc2136-min-ttl",
 		envOrInt64("EXTERNAL_DNS_RFC2136_MIN_TTL", 0),
 		"Minimum TTL enforced on all DNS records (0 = disabled)")
+	rfc2136Timeout := flag.Duration("rfc2136-timeout",
+		envOrDuration("EXTERNAL_DNS_RFC2136_TIMEOUT", 10*time.Second),
+		"Timeout for RFC2136 DNS operations (AXFR and UPDATE)")
 
 	// ---- Docker source flags ----
 	dockerHost := flag.String("docker-host",
@@ -75,6 +81,16 @@ func main() {
 	ownerID := flag.String("owner-id",
 		envOr("EXTERNAL_DNS_OWNER_ID", ""),
 		"Ownership identifier written to TXT records (default: external-dns-docker)")
+
+	// ---- Health check flags ----
+	healthPort := flag.Int("health-port",
+		envOrInt("EXTERNAL_DNS_HEALTH_PORT", 8080),
+		"Port for the HTTP health check server (0 to disable)")
+
+	// ---- Shutdown flags ----
+	shutdownTimeout := flag.Duration("shutdown-timeout",
+		envOrDuration("EXTERNAL_DNS_SHUTDOWN_TIMEOUT", 30*time.Second),
+		"Maximum time to wait for graceful shutdown after SIGTERM")
 
 	// ---- Logging flags ----
 	logLevel := flag.String("log-level",
@@ -110,6 +126,11 @@ func main() {
 		log.Error("failed to create Docker source", "err", err)
 		os.Exit(1)
 	}
+	defer func() {
+		if cerr := src.Close(); cerr != nil {
+			log.Warn("error closing Docker client", "err", cerr)
+		}
+	}()
 
 	// ---- Build RFC2136 provider ----
 	prov := rfc2136.New(rfc2136.Config{
@@ -120,6 +141,7 @@ func main() {
 		TSIGSecret:    *rfc2136TSIGSecret,
 		TSIGSecretAlg: *rfc2136TSIGAlg,
 		MinTTL:        *rfc2136MinTTL,
+		Timeout:       *rfc2136Timeout,
 	}, log)
 
 	// ---- Build controller ----
@@ -135,9 +157,17 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
 
+	// ---- Health check server ----
+	startHealthServer(ctx, *healthPort, ctrl, log)
+
 	// Start the Docker event watcher in the background (not needed for once mode).
+	var watchWg sync.WaitGroup
 	if !*once {
-		go src.Watch(ctx)
+		watchWg.Add(1)
+		go func() {
+			defer watchWg.Done()
+			src.Watch(ctx)
+		}()
 	}
 
 	// ---- Run ----
@@ -153,6 +183,60 @@ func main() {
 		log.Error("controller exited with error", "err", err)
 		os.Exit(1)
 	}
+
+	// Wait for the Watch goroutine to exit, bounded by the shutdown timeout.
+	watchDone := make(chan struct{})
+	go func() {
+		watchWg.Wait()
+		close(watchDone)
+	}()
+	select {
+	case <-watchDone:
+		log.Info("shutdown complete")
+	case <-time.After(*shutdownTimeout):
+		log.Warn("shutdown timeout exceeded, forcing exit", "timeout", shutdownTimeout.String())
+	}
+}
+
+// startHealthServer starts an HTTP server exposing /healthz (liveness) and
+// /readyz (readiness) on the given port. A port of 0 disables the server.
+// The server is shut down gracefully when ctx is cancelled.
+func startHealthServer(ctx context.Context, port int, ctrl *controller.Controller, log *slog.Logger) {
+	if port == 0 {
+		return
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintln(w, "ok")
+	})
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if ctrl.IsReady() {
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintln(w, "ok")
+		} else {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprintln(w, "not ready")
+		}
+	})
+	srv := &http.Server{
+		Addr:    fmt.Sprintf(":%d", port),
+		Handler: mux,
+	}
+	go func() {
+		<-ctx.Done()
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutCtx); err != nil {
+			log.Warn("health server shutdown error", "err", err)
+		}
+	}()
+	go func() {
+		log.Info("health server listening", "port", port)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("health server error", "err", err)
+		}
+	}()
 }
 
 // newLogger returns a JSON logger writing to stderr at the given level.

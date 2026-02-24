@@ -20,10 +20,13 @@ type dnsTransferer interface {
 	In(m *dns.Msg, addr string) (chan *dns.Envelope, error)
 }
 
-// dnsExchanger abstracts dns.Client.Exchange for testability.
+// dnsExchanger abstracts dns.Client.ExchangeContext for testability.
 type dnsExchanger interface {
-	Exchange(m *dns.Msg, addr string) (*dns.Msg, time.Duration, error)
+	ExchangeContext(ctx context.Context, m *dns.Msg, addr string) (*dns.Msg, time.Duration, error)
 }
+
+// defaultTimeout is the DNS operation timeout applied when none is configured.
+const defaultTimeout = 10 * time.Second
 
 // Config holds all RFC2136 provider configuration.
 type Config struct {
@@ -34,6 +37,7 @@ type Config struct {
 	TSIGSecret    string
 	TSIGSecretAlg string // e.g. "hmac-sha256" (trailing dot optional)
 	MinTTL        int64
+	Timeout       time.Duration // DNS operation timeout; 0 uses defaultTimeout (10s)
 }
 
 // Provider implements provider.Provider against an RFC2136-capable DNS server.
@@ -50,6 +54,9 @@ type Provider struct {
 func New(cfg Config, log *slog.Logger) *Provider {
 	if cfg.Port == 0 {
 		cfg.Port = 53
+	}
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = defaultTimeout
 	}
 	if log == nil {
 		log = slog.Default()
@@ -72,6 +79,7 @@ func New(cfg Config, log *slog.Logger) *Provider {
 		exchanger: &dns.Client{
 			Net:        "tcp",
 			TsigSecret: tsigSecret,
+			Timeout:    cfg.Timeout,
 		},
 	}
 }
@@ -95,7 +103,7 @@ func newWithDeps(cfg Config, log *slog.Logger, t dnsTransferer, e dnsExchanger) 
 }
 
 // Records fetches the current zone contents via AXFR and returns them as Endpoints.
-func (p *Provider) Records(_ context.Context) ([]*endpoint.Endpoint, error) {
+func (p *Provider) Records(ctx context.Context) ([]*endpoint.Endpoint, error) {
 	m := new(dns.Msg)
 	m.SetAxfr(dns.Fqdn(p.cfg.Zone))
 	if p.cfg.TSIGKeyName != "" {
@@ -108,22 +116,29 @@ func (p *Provider) Records(_ context.Context) ([]*endpoint.Endpoint, error) {
 	}
 
 	var endpoints []*endpoint.Endpoint
-	for e := range env {
-		if e.Error != nil {
-			return nil, fmt.Errorf("axfr %s: %w", p.cfg.Zone, e.Error)
-		}
-		for _, rr := range e.RR {
-			ep := rrToEndpoint(rr)
-			if ep != nil {
-				endpoints = append(endpoints, ep)
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case e, ok := <-env:
+			if !ok {
+				return endpoints, nil
+			}
+			if e.Error != nil {
+				return nil, fmt.Errorf("axfr %s: %w", p.cfg.Zone, e.Error)
+			}
+			for _, rr := range e.RR {
+				ep := rrToEndpoint(rr)
+				if ep != nil {
+					endpoints = append(endpoints, ep)
+				}
 			}
 		}
 	}
-	return endpoints, nil
 }
 
 // ApplyChanges sends RFC2136 UPDATE messages to create, update, and delete records.
-func (p *Provider) ApplyChanges(_ context.Context, changes *plan.Changes) error {
+func (p *Provider) ApplyChanges(ctx context.Context, changes *plan.Changes) error {
 	if changes.IsEmpty() {
 		return nil
 	}
@@ -178,7 +193,7 @@ func (p *Provider) ApplyChanges(_ context.Context, changes *plan.Changes) error 
 		m.SetTsig(dns.Fqdn(p.cfg.TSIGKeyName), p.tsigAlg, 300, time.Now().Unix())
 	}
 
-	r, _, err := p.exchanger.Exchange(m, p.server)
+	r, _, err := p.exchanger.ExchangeContext(ctx, m, p.server)
 	if err != nil {
 		return fmt.Errorf("dns update exchange: %w", err)
 	}

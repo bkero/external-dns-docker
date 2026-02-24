@@ -327,6 +327,41 @@ func TestNew_NilLog_UsesDefault(t *testing.T) {
 	}
 }
 
+// --- IsReady ---
+
+func TestIsReady_FalseBeforeFirstReconcile(t *testing.T) {
+	src := fake_source.New(nil)
+	prov := fake_provider.New(nil)
+	c := New(src, prov, slog.Default(), Config{Once: true})
+	if c.IsReady() {
+		t.Error("IsReady() = true before first reconcile, want false")
+	}
+}
+
+func TestIsReady_TrueAfterSuccessfulReconcile(t *testing.T) {
+	src := fake_source.New(nil)
+	prov := fake_provider.New(nil)
+	c := New(src, prov, slog.Default(), Config{Once: true})
+
+	if err := c.Run(context.Background()); err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	if !c.IsReady() {
+		t.Error("IsReady() = false after successful reconcile, want true")
+	}
+}
+
+func TestIsReady_FalseAfterFailedReconcile(t *testing.T) {
+	src := &errSource{err: errors.New("docker unavailable")}
+	prov := fake_provider.New(nil)
+	c := New(src, prov, slog.Default(), Config{Once: true})
+
+	_ = c.Run(context.Background()) // expect error; ignore it
+	if c.IsReady() {
+		t.Error("IsReady() = true after failed reconcile, want false")
+	}
+}
+
 // --- reconcileCh error path ---
 
 func TestRun_EventReconcileError_LogsAndContinues(t *testing.T) {
