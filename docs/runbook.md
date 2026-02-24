@@ -291,8 +291,9 @@ downward (e.g. `2s`) for faster recovery after transient DNS outages; keep
       The daemon writes no files at runtime.
 - [ ] **No new privileges**: add `security_opt: [no-new-privileges:true]` in
       Compose / Swarm.
-- [ ] **Non-root user**: the container image should run as a non-root UID.
-      Ensure the UID has access to the Docker socket group.
+- [ ] **Root in container, read-only socket**: the container runs as root (required
+      to read the Docker socket). Mount the socket read-only (`:ro`) to restrict
+      what the container can do with that access.
 - [ ] **Network policy**: restrict outbound access to only the DNS server's IP
       and port (TCP 53 for UPDATE, AXFR). No inbound is required except for the
       health-check port from monitoring systems.
