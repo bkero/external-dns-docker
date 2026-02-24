@@ -41,7 +41,10 @@ func main() {
 		"TSIG key name")
 	rfc2136TSIGSecret := flag.String("rfc2136-tsig-secret",
 		envOr("EXTERNAL_DNS_RFC2136_TSIG_SECRET", ""),
-		"TSIG secret (base64-encoded)")
+		"TSIG secret (base64-encoded); mutually exclusive with --rfc2136-tsig-secret-file")
+	rfc2136TSIGSecretFile := flag.String("rfc2136-tsig-secret-file",
+		envOr("EXTERNAL_DNS_RFC2136_TSIG_SECRET_FILE", ""),
+		"Path to file containing base64-encoded TSIG secret; mutually exclusive with --rfc2136-tsig-secret")
 	rfc2136TSIGAlg := flag.String("rfc2136-tsig-alg",
 		envOr("EXTERNAL_DNS_RFC2136_TSIG_ALG", "hmac-sha256"),
 		"TSIG algorithm (e.g. hmac-sha256, hmac-sha512)")
@@ -126,6 +129,21 @@ func main() {
 		os.Exit(1)
 	}
 
+	// ---- Resolve TSIG secret (flag vs. file) ----
+	if *rfc2136TSIGSecret != "" && *rfc2136TSIGSecretFile != "" {
+		log.Error("--rfc2136-tsig-secret and --rfc2136-tsig-secret-file are mutually exclusive")
+		os.Exit(1)
+	}
+	tsigSecret := *rfc2136TSIGSecret
+	if *rfc2136TSIGSecretFile != "" {
+		data, err := os.ReadFile(*rfc2136TSIGSecretFile)
+		if err != nil {
+			log.Error("failed to read TSIG secret file", "path", *rfc2136TSIGSecretFile, "err", err)
+			os.Exit(1)
+		}
+		tsigSecret = strings.TrimSpace(string(data))
+	}
+
 	// ---- Build Docker source ----
 	var dockerOpts []dockerclient.Opt
 	if *dockerHost != "" {
@@ -153,7 +171,7 @@ func main() {
 		Port:          *rfc2136Port,
 		Zone:          *rfc2136Zone,
 		TSIGKeyName:   *rfc2136TSIGKey,
-		TSIGSecret:    *rfc2136TSIGSecret,
+		TSIGSecret:    tsigSecret,
 		TSIGSecretAlg: *rfc2136TSIGAlg,
 		MinTTL:        *rfc2136MinTTL,
 		Timeout:       *rfc2136Timeout,

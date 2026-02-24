@@ -1,0 +1,90 @@
+# Docker Swarm stack file for external-dns-docker.
+#
+# Usage:
+#   1. Create the TSIG secret:
+#        printf 'YOUR_BASE64_SECRET' | docker secret create tsig_secret -
+#   2. Deploy the stack:
+#        docker stack deploy -c deploy/swarm-stack.yml external-dns-docker
+#
+# NOTE: external-dns-docker must be pinned to a single replica and constrained
+# to the manager node so it can access the Docker socket.
+
+version: "3.9"
+
+services:
+  external-dns-docker:
+    image: ghcr.io/bkero/external-dns-docker:latest
+    read_only: true
+
+    environment:
+      EXTERNAL_DNS_RFC2136_HOST: "${EXTERNAL_DNS_RFC2136_HOST}"
+      EXTERNAL_DNS_RFC2136_PORT: "${EXTERNAL_DNS_RFC2136_PORT:-53}"
+      EXTERNAL_DNS_RFC2136_ZONE: "${EXTERNAL_DNS_RFC2136_ZONE}"
+      EXTERNAL_DNS_RFC2136_TSIG_KEY: "${EXTERNAL_DNS_RFC2136_TSIG_KEY}"
+      EXTERNAL_DNS_RFC2136_TSIG_SECRET_FILE: /run/secrets/tsig_secret
+      EXTERNAL_DNS_RFC2136_TSIG_ALG: "${EXTERNAL_DNS_RFC2136_TSIG_ALG:-hmac-sha256}"
+      EXTERNAL_DNS_RFC2136_MIN_TTL: "${EXTERNAL_DNS_RFC2136_MIN_TTL:-0}"
+      EXTERNAL_DNS_RFC2136_TIMEOUT: "${EXTERNAL_DNS_RFC2136_TIMEOUT:-10s}"
+      EXTERNAL_DNS_INTERVAL: "${EXTERNAL_DNS_INTERVAL:-60s}"
+      EXTERNAL_DNS_DEBOUNCE: "${EXTERNAL_DNS_DEBOUNCE:-5s}"
+      EXTERNAL_DNS_OWNER_ID: "${EXTERNAL_DNS_OWNER_ID:-external-dns-docker}"
+      EXTERNAL_DNS_HEALTH_PORT: "${EXTERNAL_DNS_HEALTH_PORT:-8080}"
+      EXTERNAL_DNS_LOG_LEVEL: "${EXTERNAL_DNS_LOG_LEVEL:-info}"
+
+    secrets:
+      - tsig_secret
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+    ports:
+      - target: 8080
+        published: 8080
+        protocol: tcp
+        mode: host
+
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          # Must run on a manager node to access the Docker socket
+          - node.role == manager
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 64M
+        reservations:
+          cpus: "0.05"
+          memory: 16M
+      restart_policy:
+        condition: any
+        delay: 5s
+        max_attempts: 5
+        window: 60s
+      update_config:
+        parallelism: 1
+        delay: 10s
+        failure_action: rollback
+        order: stop-first
+      rollback_config:
+        parallelism: 1
+        delay: 5s
+        failure_action: pause
+        order: stop-first
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+secrets:
+  tsig_secret:
+    external: true

@@ -1,0 +1,52 @@
+# Production Docker Compose file for external-dns-docker.
+#
+# Usage:
+#   1. Copy deploy/.env.example to deploy/.env and fill in your values.
+#   2. Create the TSIG secret file referenced by EXTERNAL_DNS_RFC2136_TSIG_SECRET_FILE:
+#        echo -n "YOUR_BASE64_SECRET" > /run/secrets/tsig_secret
+#        chmod 600 /run/secrets/tsig_secret
+#   3. Start the service:
+#        docker compose -f deploy/docker-compose.yml up -d
+
+services:
+  external-dns-docker:
+    image: ghcr.io/bkero/external-dns-docker:latest
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+
+    # Load configuration from deploy/.env (copy from deploy/.env.example)
+    env_file: .env
+
+    volumes:
+      # Docker socket — required for container event watching
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # TSIG secret file — adjust path if not using the default location
+      - /run/secrets/tsig_secret:/run/secrets/tsig_secret:ro
+
+    ports:
+      # Health check and metrics port. Remove or restrict if not needed externally.
+      - "127.0.0.1:8080:8080"
+
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 64M
+        reservations:
+          cpus: "0.05"
+          memory: 16M
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -22,6 +24,42 @@ var dockerEventsTotal = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "external_dns_docker_docker_events_total",
 	Help: "Total number of Docker container lifecycle events received.",
 })
+
+// labelRE matches a single valid RFC 1123 DNS label (1–63 characters).
+var labelRE = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?$`)
+
+// ipv4RE matches strings that look like an IPv4 address (four dot-separated decimals).
+// Used to detect "almost-IPv4" strings that fail net.ParseIP validation.
+var ipv4RE = regexp.MustCompile(`^\d+\.\d+\.\d+\.\d+$`)
+
+// isValidHostname reports whether name is a syntactically valid DNS hostname
+// per RFC 1123: one or more dot-separated labels, each 1–63 characters of
+// [A-Za-z0-9-], not starting or ending with a hyphen, total ≤ 253 characters.
+func isValidHostname(name string) bool {
+	name = strings.TrimSuffix(name, ".")
+	if len(name) == 0 || len(name) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(name, ".") {
+		if !labelRE.MatchString(label) {
+			return false
+		}
+	}
+	return true
+}
+
+// isValidTarget reports whether target is a valid A/AAAA/CNAME value.
+// Strings matching the four-octet decimal pattern that are not valid IPv4
+// addresses are explicitly rejected (e.g. "999.999.999.999").
+func isValidTarget(target string) bool {
+	if ipv4RE.MatchString(target) {
+		return net.ParseIP(target) != nil
+	}
+	if net.ParseIP(target) != nil {
+		return true // valid IPv6
+	}
+	return isValidHostname(target)
+}
 
 const (
 	labelPrefix     = "external-dns.io/"
@@ -188,11 +226,21 @@ func (s *DockerSource) parseSingle(containerID, hostname, target, rawTTL, rawRec
 	if hostname == "" {
 		return nil
 	}
+	if !isValidHostname(hostname) {
+		s.log.Warn("container has invalid hostname label, skipping",
+			"container", containerID, "hostname", hostname)
+		return nil
+	}
 
 	target = strings.TrimSpace(target)
 	if target == "" {
 		s.log.Warn("container missing target label, skipping",
 			"container", containerID, "hostname", hostname)
+		return nil
+	}
+	if !isValidTarget(target) {
+		s.log.Warn("container has invalid target label, skipping",
+			"container", containerID, "hostname", hostname, "target", target)
 		return nil
 	}
 

@@ -552,6 +552,117 @@ func TestDockerSource_Close_NoError(t *testing.T) {
 	}
 }
 
+// --- Hostname and target validation tests ---
+
+func TestDockerSource_InvalidHostname_Skipped(t *testing.T) {
+	src, _ := newTestSource([]container.Summary{
+		{
+			ID: "abc123",
+			Labels: map[string]string{
+				"external-dns.io/hostname": "not_valid!!",
+				"external-dns.io/target":   "10.0.0.1",
+			},
+		},
+	})
+
+	eps, err := src.Endpoints(context.Background())
+	if err != nil {
+		t.Fatalf("Endpoints() error = %v", err)
+	}
+	if len(eps) != 0 {
+		t.Errorf("got %d endpoints, want 0 (invalid hostname)", len(eps))
+	}
+}
+
+func TestDockerSource_InvalidTargetIP_Skipped(t *testing.T) {
+	src, _ := newTestSource([]container.Summary{
+		{
+			ID: "abc123",
+			Labels: map[string]string{
+				"external-dns.io/hostname": "app.example.com",
+				"external-dns.io/target":   "999.999.999.999",
+			},
+		},
+	})
+
+	eps, err := src.Endpoints(context.Background())
+	if err != nil {
+		t.Fatalf("Endpoints() error = %v", err)
+	}
+	if len(eps) != 0 {
+		t.Errorf("got %d endpoints, want 0 (invalid IP target)", len(eps))
+	}
+}
+
+func TestDockerSource_InvalidCNAMETarget_Skipped(t *testing.T) {
+	src, _ := newTestSource([]container.Summary{
+		{
+			ID: "abc123",
+			Labels: map[string]string{
+				"external-dns.io/hostname": "app.example.com",
+				"external-dns.io/target":   "not_a!!hostname",
+			},
+		},
+	})
+
+	eps, err := src.Endpoints(context.Background())
+	if err != nil {
+		t.Fatalf("Endpoints() error = %v", err)
+	}
+	if len(eps) != 0 {
+		t.Errorf("got %d endpoints, want 0 (invalid CNAME target)", len(eps))
+	}
+}
+
+func TestIsValidHostname(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		valid bool
+	}{
+		{"simple", "example.com", true},
+		{"subdomain", "app.example.com", true},
+		{"single label", "localhost", true},
+		{"with numbers", "host1.example.com", true},
+		{"trailing dot", "example.com.", true},
+		{"underscore", "not_valid.example.com", false},
+		{"exclamation", "not!valid.example.com", false},
+		{"empty label", "app..example.com", false},
+		{"too long label", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.com", false},
+		{"leading hyphen", "-invalid.com", false},
+		{"trailing hyphen", "invalid-.com", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isValidHostname(tc.input); got != tc.valid {
+				t.Errorf("isValidHostname(%q) = %v, want %v", tc.input, got, tc.valid)
+			}
+		})
+	}
+}
+
+func TestIsValidTarget(t *testing.T) {
+	tests := []struct {
+		name   string
+		target string
+		valid  bool
+	}{
+		{"valid IPv4", "10.0.0.1", true},
+		{"valid IPv6", "2001:db8::1", true},
+		{"valid hostname", "backend.example.com", true},
+		{"invalid IPv4 octets", "999.999.999.999", false},
+		{"invalid hostname chars", "not_a!!hostname", false},
+		{"partial IP (valid hostname)", "10.0.0", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isValidTarget(tc.target); got != tc.valid {
+				t.Errorf("isValidTarget(%q) = %v, want %v", tc.target, got, tc.valid)
+			}
+		})
+	}
+}
+
 // --- parseSingle empty hostname path ---
 
 func TestDockerSource_WhitespaceHostname_Skipped(t *testing.T) {
