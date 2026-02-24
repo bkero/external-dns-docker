@@ -29,8 +29,8 @@ import (
 
 const (
 	bindHost    = "127.0.0.1"
-	bindPort    = 5353
-	bindAddr    = "127.0.0.1:5353"
+	bindPort    = 5354
+	bindAddr    = "127.0.0.1:5354"
 	zone        = "example.com"
 	tsigKeyName = "external-dns-test"
 	// base64("test-key-for-external-dns-docker")
