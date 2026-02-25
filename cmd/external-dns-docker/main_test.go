@@ -457,3 +457,48 @@ func TestLoadZoneConfigsFromFile_FileNotFound_ReturnsError(t *testing.T) {
 		t.Error("expected error for missing file, got nil")
 	}
 }
+
+func TestLoadZoneConfigsFromFile_TSIGSecretFile_NotFound_ReturnsError(t *testing.T) {
+	path := writeYAML(t, `
+zones:
+  - host: ns1.example.com
+    zone: example.com.
+    tsig-secret-file: /nonexistent/tsig.secret
+`)
+	_, err := loadZoneConfigsFromFile(path)
+	if err == nil {
+		t.Error("expected error for missing tsig-secret-file, got nil")
+	}
+}
+
+func TestLoadZoneConfigsFromFile_InvalidYAML_ReturnsError(t *testing.T) {
+	path := writeYAML(t, `not: valid: yaml: [`)
+	_, err := loadZoneConfigsFromFile(path)
+	if err == nil {
+		t.Error("expected error for invalid YAML, got nil")
+	}
+}
+
+func TestLoadZoneConfigsFromEnv_TSIGSecretFile_NotFound_ReturnsError(t *testing.T) {
+	clearZoneEnv(t)
+	t.Setenv("EXTERNAL_DNS_RFC2136_ZONE_TEST_HOST", "ns1.example.com")
+	t.Setenv("EXTERNAL_DNS_RFC2136_ZONE_TEST_ZONE", "example.com.")
+	t.Setenv("EXTERNAL_DNS_RFC2136_ZONE_TEST_TSIG_SECRET_FILE", "/nonexistent/tsig.secret")
+
+	_, _, err := loadZoneConfigsFromEnv()
+	if err == nil {
+		t.Error("expected error for missing TSIG_SECRET_FILE, got nil")
+	}
+}
+
+func TestLoadZoneConfigsFromEnv_InvalidPort_ReturnsError(t *testing.T) {
+	clearZoneEnv(t)
+	t.Setenv("EXTERNAL_DNS_RFC2136_ZONE_TEST_HOST", "ns1.example.com")
+	t.Setenv("EXTERNAL_DNS_RFC2136_ZONE_TEST_ZONE", "example.com.")
+	t.Setenv("EXTERNAL_DNS_RFC2136_ZONE_TEST_PORT", "notanumber")
+
+	_, _, err := loadZoneConfigsFromEnv()
+	if err == nil {
+		t.Error("expected error for invalid PORT, got nil")
+	}
+}

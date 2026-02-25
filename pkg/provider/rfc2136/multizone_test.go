@@ -273,6 +273,78 @@ func TestMultiApplyChanges_DeleteRoutedToCorrectZone(t *testing.T) {
 	}
 }
 
+func TestMultiApplyChanges_UpdateRoutedToCorrectZone(t *testing.T) {
+	exA := &mockExchanger{resp: successResp()}
+	exB := &mockExchanger{resp: successResp()}
+
+	configs := twoZoneConfigs()
+	m := &MultiProvider{log: slog.Default()}
+	m.zones = []zoneEntry{
+		{zone: dns.Fqdn(configs[0].Zone), prov: newWithDeps(Config{Host: configs[0].Host, Zone: configs[0].Zone, TSIGKeyName: configs[0].TSIGKey, TSIGSecret: configs[0].TSIGSecret}, nil, nil, exA)},
+		{zone: dns.Fqdn(configs[1].Zone), prov: newWithDeps(Config{Host: configs[1].Host, Zone: configs[1].Zone, TSIGKeyName: configs[1].TSIGKey, TSIGSecret: configs[1].TSIGSecret}, nil, nil, exB)},
+	}
+
+	old := endpoint.New("app.example.com", []string{"1.2.3.4"}, endpoint.RecordTypeA, 300, nil)
+	newEp := endpoint.New("app.example.com", []string{"5.6.7.8"}, endpoint.RecordTypeA, 300, nil)
+
+	err := m.ApplyChanges(context.Background(), &plan.Changes{
+		UpdateOld: []*endpoint.Endpoint{old},
+		UpdateNew: []*endpoint.Endpoint{newEp},
+	})
+	if err != nil {
+		t.Fatalf("ApplyChanges() error = %v", err)
+	}
+	if exA.sent == nil {
+		t.Error("expected example.com provider to be called for update")
+	}
+	if exB.sent != nil {
+		t.Error("expected bke.ro provider NOT to be called for example.com update")
+	}
+}
+
+func TestMultiApplyChanges_UnmatchedUpdateSkipped(t *testing.T) {
+	exA := &mockExchanger{resp: successResp()}
+
+	configs := twoZoneConfigs()
+	m := &MultiProvider{log: slog.Default()}
+	m.zones = []zoneEntry{
+		{zone: dns.Fqdn(configs[0].Zone), prov: newWithDeps(Config{Host: configs[0].Host, Zone: configs[0].Zone}, nil, nil, exA)},
+	}
+
+	old := endpoint.New("app.unknown.tld", []string{"1.2.3.4"}, endpoint.RecordTypeA, 300, nil)
+	newEp := endpoint.New("app.unknown.tld", []string{"5.6.7.8"}, endpoint.RecordTypeA, 300, nil)
+
+	err := m.ApplyChanges(context.Background(), &plan.Changes{
+		UpdateOld: []*endpoint.Endpoint{old},
+		UpdateNew: []*endpoint.Endpoint{newEp},
+	})
+	if err != nil {
+		t.Fatalf("ApplyChanges() error = %v (unmatched update should be skipped)", err)
+	}
+	if exA.sent != nil {
+		t.Error("expected provider NOT to be called for unmatched update endpoint")
+	}
+}
+
+func TestMultiApplyChanges_SubProviderError_ReturnsError(t *testing.T) {
+	me := &mockExchanger{err: fmt.Errorf("update failed")}
+
+	configs := twoZoneConfigs()
+	m := &MultiProvider{log: slog.Default()}
+	m.zones = []zoneEntry{
+		{zone: dns.Fqdn(configs[0].Zone), prov: newWithDeps(Config{Host: configs[0].Host, Zone: configs[0].Zone, TSIGKeyName: configs[0].TSIGKey, TSIGSecret: configs[0].TSIGSecret}, nil, nil, me)},
+	}
+
+	err := m.ApplyChanges(context.Background(), &plan.Changes{
+		Create: []*endpoint.Endpoint{
+			endpoint.New("app.example.com", []string{"1.2.3.4"}, endpoint.RecordTypeA, 300, nil),
+		},
+	})
+	if err == nil {
+		t.Error("expected error from sub-provider ApplyChanges failure, got nil")
+	}
+}
+
 // --- Preflight tests ---
 
 func TestMultiPreflight_AllSuccess(t *testing.T) {
