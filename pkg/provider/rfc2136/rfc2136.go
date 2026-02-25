@@ -74,7 +74,10 @@ func New(cfg Config, log *slog.Logger) *Provider {
 		tsigAlg: alg,
 		log:     log,
 		newTransferer: func() dnsTransferer {
-			return &dns.Transfer{TsigSecret: tsigSecret}
+			return &dns.Transfer{
+				TsigSecret:  tsigSecret,
+				ReadTimeout: cfg.Timeout,
+			}
 		},
 		exchanger: &dns.Client{
 			Net:        "tcp",

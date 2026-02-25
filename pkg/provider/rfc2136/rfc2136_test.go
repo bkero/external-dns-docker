@@ -662,6 +662,28 @@ func TestNew_DefaultTimeout(t *testing.T) {
 	}
 }
 
+func TestNew_TransferReadTimeout_MatchesConfig(t *testing.T) {
+	p := New(Config{Host: "ns1.example.com", Zone: "example.com", Timeout: 7 * time.Second}, nil)
+	tr, ok := p.newTransferer().(*dns.Transfer)
+	if !ok {
+		t.Fatal("newTransferer() did not return *dns.Transfer")
+	}
+	if tr.ReadTimeout != 7*time.Second {
+		t.Errorf("Transfer.ReadTimeout = %v, want 7s", tr.ReadTimeout)
+	}
+}
+
+func TestNew_TransferReadTimeout_DefaultWhenZero(t *testing.T) {
+	p := New(Config{Host: "ns1.example.com", Zone: "example.com"}, nil)
+	tr, ok := p.newTransferer().(*dns.Transfer)
+	if !ok {
+		t.Fatal("newTransferer() did not return *dns.Transfer")
+	}
+	if tr.ReadTimeout != defaultTimeout {
+		t.Errorf("Transfer.ReadTimeout = %v, want %v", tr.ReadTimeout, defaultTimeout)
+	}
+}
+
 // blockingTransferer returns a channel that never delivers envelopes, simulating a hung AXFR.
 type blockingTransferer struct{}
 
